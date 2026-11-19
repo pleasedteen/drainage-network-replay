@@ -1,0 +1,3 @@
+B-0006-p1.json is deliberately not delivered in this demo.
+The published snapshot stays at seq 5 while the source finishes the
+batch, and traces keep working.

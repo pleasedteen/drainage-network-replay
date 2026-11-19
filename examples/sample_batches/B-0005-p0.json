@@ -1,0 +1,1 @@
+{"segment":"B-0005-p0","batch":"B-0005","seq":5,"total":6,"part":0,"parts":1,"upgrade":false,"producer":"offline-replay","sent_at":"2026-11-19T00:00:00Z","taps":[{"ref":"C4:01040","attrs":{"kind":"污水","district":"城东"}}],"lays":[{"code":"P-090300","from":"C4:01040","to":"J-001008"}],"retires":[{"kind":"joint","ref":"C4:01009"}]}
