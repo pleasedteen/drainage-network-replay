@@ -18,7 +18,7 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-from . import archive, snapshot
+from . import archive, history, snapshot
 from .db import connect, init_db
 
 
@@ -57,6 +57,16 @@ class SyncService:
             finally:
                 conn.close()
 
+    # -- history ------------------------------------------------------------
+    def backfill_history(self, *, progress=None) -> dict:
+        """Rebuild missing per-batch history from landed data, online.
+
+        Publishing and querying continue while it runs (coordination is via
+        the history watermark, not this process' publish lock); a batch's
+        history only becomes visible once it is complete.
+        """
+        return history.backfill(self.db_path, progress=progress)
+
     # -- reports ----------------------------------------------------------
     def status(self) -> dict:
         conn = connect(self.db_path, read_only=True)
@@ -72,6 +82,7 @@ class SyncService:
             return {
                 "snapshot": _snapshot_dict(conn),
                 "applied_seq": applied,
+                "history": history.status_dict(conn),
                 "batches": batches,
                 "publish_blocker": snapshot._blocker(conn),
             }

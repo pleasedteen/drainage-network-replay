@@ -75,6 +75,46 @@ def main():
     print()
     print("5. human-readable answer for the duty officer")
     print(get(port, "/v1/trace/upstream?ref=C4:01012&format=text"))
+
+    print("6. the same joint traced as of earlier published batches")
+    print("   (numbering follows the batch: C4:01012 did not exist before")
+    print("   the B-0003 upgrade, so as of B-0002 we ask for J-001012)")
+    for batch, ref in (("B-0002", "J-001012"), ("B-0004", "C4:01012")):
+        data = json.loads(get(port, f"/v1/trace/upstream?ref={ref}"
+                                    f"&batch={batch}"))
+        print(f"   as of {data['snapshot']['published_batch']}: "
+              f"{data['totals']['upstream_joints']} joints, "
+              f"{data['totals']['upstream_pipes']} pipes, basis "
+              f"{[b['batch'] for b in data['basis']['referenced_batches']]}")
+    latest = json.loads(get(port, "/v1/trace/upstream?ref=C4:01012"))
+    print(f"   latest   : {latest['totals']['upstream_joints']} joints, "
+          f"{latest['totals']['upstream_pipes']} pipes, basis "
+          f"{[b['batch'] for b in latest['basis']['referenced_batches']]}")
+    srv.shutdown()
+
+    print()
+    print("7. a database created before history tracking backfills online")
+    from app.db import connect
+    conn = connect(work / "drain.db")      # autocommit connection
+    for table in ("hist_joints", "hist_pipes", "hist_refs"):
+        conn.execute(f"DELETE FROM {table}")
+    conn.execute("DELETE FROM meta WHERE key='history_upto_seq'")
+    conn.close()
+    st = svc.status()["history"]
+    print(f"   history wiped (simulating a pre-history database): {st}")
+    srv = make_server(work / "drain.db", work / "data", port=0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    import urllib.error
+    try:
+        get(port, "/v1/trace/upstream?ref=J-001012&batch=B-0002")
+    except urllib.error.HTTPError as exc:
+        print(f"   as-of query while unbuilt -> HTTP {exc.code} "
+              f"(never a partial answer)")
+    out = svc.backfill_history()
+    print(f"   backfill copied seqs {out['copied']} -> {out['history']}")
+    data = json.loads(get(port, "/v1/trace/upstream?ref=J-001012&batch=B-0002"))
+    print(f"   as of B-0002 now answers: {data['totals']}")
     srv.shutdown()
 
     print("artifacts kept in", work)

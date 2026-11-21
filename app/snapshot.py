@@ -22,6 +22,8 @@ import json
 import sqlite3
 import time
 
+from . import history
+from .db import meta_get, meta_set  # noqa: F401  (re-exported for callers)
 from .ids import parse_ref
 
 
@@ -31,17 +33,6 @@ class ApplyError(ValueError):
 
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def meta_get(conn, key, default=None):
-    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-    return row["value"] if row else default
-
-
-def meta_set(conn, key, value):
-    conn.execute("INSERT INTO meta(key,value) VALUES(?,?) "
-                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                 (key, str(value)))
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +329,7 @@ def apply_batch(conn, row) -> dict:
                              f"upgrade already happened at seq {first}")
         meta_set(conn, "upgrade_seq", seq)
 
+    recording = history.begin_batch(conn, seq)
     for _, fn in APPLIERS:
         fn(conn, batch_id, seq, effects)
 
@@ -349,6 +341,8 @@ def apply_batch(conn, row) -> dict:
     conn.execute("UPDATE batches SET state='applied', applied_at=?, error=NULL "
                  "WHERE batch_id=?", (_now(), batch_id))
     meta_set(conn, "applied_seq", seq)
+    if recording:
+        history.end_batch(conn, seq)
     return effects
 
 

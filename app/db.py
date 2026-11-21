@@ -121,6 +121,142 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 ) WITHOUT ROWID;
 
+-- ---------------------------------------------------------------------------
+-- per-batch history ("as of batch N" queries)
+--
+-- Three temporal tables hold one row per *version* of a joint / pipe /
+-- reference: valid from ``from_seq`` (inclusive) until ``to_seq`` (exclusive,
+-- NULL = still current).  A batch only adds rows for the entities it actually
+-- changed, so the storage increment of a small 改接 batch is a handful of
+-- rows, and an as-of query is an indexed range scan -- never a replay.
+--
+-- The rows are written by triggers while a batch is applied, inside the same
+-- transaction, but only when ``hist_context.seq`` names the batch being
+-- applied (see app/history.py): the publisher sets it when the history
+-- watermark allows, the backfill replay sets it for every replayed batch.
+-- The watermark ``meta.history_upto_seq`` advances in the same transaction
+-- as the rows, so a version is either complete and visible or not there at
+-- all -- partial history is never served.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS hist_joints (
+    uid      INTEGER NOT NULL,
+    from_seq INTEGER NOT NULL,
+    to_seq   INTEGER,
+    zone     TEXT NOT NULL,
+    local    TEXT NOT NULL,
+    attrs    TEXT,
+    retired  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (uid, from_seq)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS hist_joints_from ON hist_joints(from_seq);
+
+CREATE TABLE IF NOT EXISTS hist_pipes (
+    code     TEXT NOT NULL,
+    from_seq INTEGER NOT NULL,
+    to_seq   INTEGER,
+    from_uid INTEGER NOT NULL,
+    to_uid   INTEGER NOT NULL,
+    attrs    TEXT,
+    retired  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (code, from_seq)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS hist_pipes_to ON hist_pipes(to_uid, from_seq);
+CREATE INDEX IF NOT EXISTS hist_pipes_from ON hist_pipes(from_seq);
+
+CREATE TABLE IF NOT EXISTS hist_refs (
+    ref      TEXT NOT NULL,
+    from_seq INTEGER NOT NULL,
+    to_seq   INTEGER,
+    uid      INTEGER NOT NULL,
+    kind     TEXT NOT NULL,
+    PRIMARY KEY (ref, from_seq)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS hist_refs_uid ON hist_refs(uid, from_seq);
+CREATE INDEX IF NOT EXISTS hist_refs_from ON hist_refs(from_seq);
+
+-- one-row switchboard: which batch seq the triggers below are recording
+-- (NULL = not recording).  Transactional, so a rolled-back batch clears it.
+CREATE TABLE IF NOT EXISTS hist_context (
+    id  INTEGER PRIMARY KEY CHECK (id = 1),
+    seq INTEGER
+);
+
+CREATE TRIGGER IF NOT EXISTS hist_joints_ins AFTER INSERT ON joints
+WHEN (SELECT seq FROM hist_context WHERE id = 1) IS NOT NULL
+BEGIN
+    INSERT INTO hist_joints(uid, from_seq, to_seq, zone, local, attrs, retired)
+    VALUES (NEW.uid, (SELECT seq FROM hist_context WHERE id = 1), NULL,
+            NEW.zone, NEW.local, NEW.attrs, NEW.retired_seq IS NOT NULL);
+END;
+
+-- a change to a tracked column closes the previous version (unless it was
+-- opened by this very batch) and opens a new one; several changes to the same
+-- joint inside one batch collapse into a single version row.
+CREATE TRIGGER IF NOT EXISTS hist_joints_upd AFTER UPDATE ON joints
+WHEN (SELECT seq FROM hist_context WHERE id = 1) IS NOT NULL
+ AND (OLD.zone IS NOT NEW.zone OR OLD.local IS NOT NEW.local
+      OR OLD.attrs IS NOT NEW.attrs
+      OR (OLD.retired_seq IS NULL) IS NOT (NEW.retired_seq IS NULL))
+BEGIN
+    UPDATE hist_joints SET to_seq = (SELECT seq FROM hist_context WHERE id = 1)
+    WHERE uid = OLD.uid AND to_seq IS NULL
+      AND from_seq < (SELECT seq FROM hist_context WHERE id = 1);
+    INSERT INTO hist_joints(uid, from_seq, to_seq, zone, local, attrs, retired)
+    VALUES (NEW.uid, (SELECT seq FROM hist_context WHERE id = 1), NULL,
+            NEW.zone, NEW.local, NEW.attrs, NEW.retired_seq IS NOT NULL)
+    ON CONFLICT(uid, from_seq) DO UPDATE SET
+        zone = excluded.zone, local = excluded.local, attrs = excluded.attrs,
+        retired = excluded.retired, to_seq = NULL;
+END;
+
+CREATE TRIGGER IF NOT EXISTS hist_pipes_ins AFTER INSERT ON pipes
+WHEN (SELECT seq FROM hist_context WHERE id = 1) IS NOT NULL
+BEGIN
+    INSERT INTO hist_pipes(code, from_seq, to_seq, from_uid, to_uid, attrs,
+                           retired)
+    VALUES (NEW.code, (SELECT seq FROM hist_context WHERE id = 1), NULL,
+            NEW.from_uid, NEW.to_uid, NEW.attrs, NEW.retired_seq IS NOT NULL);
+END;
+
+CREATE TRIGGER IF NOT EXISTS hist_pipes_upd AFTER UPDATE ON pipes
+WHEN (SELECT seq FROM hist_context WHERE id = 1) IS NOT NULL
+ AND (OLD.from_uid IS NOT NEW.from_uid OR OLD.to_uid IS NOT NEW.to_uid
+      OR OLD.attrs IS NOT NEW.attrs
+      OR (OLD.retired_seq IS NULL) IS NOT (NEW.retired_seq IS NULL))
+BEGIN
+    UPDATE hist_pipes SET to_seq = (SELECT seq FROM hist_context WHERE id = 1)
+    WHERE code = OLD.code AND to_seq IS NULL
+      AND from_seq < (SELECT seq FROM hist_context WHERE id = 1);
+    INSERT INTO hist_pipes(code, from_seq, to_seq, from_uid, to_uid, attrs,
+                           retired)
+    VALUES (NEW.code, (SELECT seq FROM hist_context WHERE id = 1), NULL,
+            NEW.from_uid, NEW.to_uid, NEW.attrs, NEW.retired_seq IS NOT NULL)
+    ON CONFLICT(code, from_seq) DO UPDATE SET
+        from_uid = excluded.from_uid, to_uid = excluded.to_uid,
+        attrs = excluded.attrs, retired = excluded.retired, to_seq = NULL;
+END;
+
+CREATE TRIGGER IF NOT EXISTS hist_refs_ins AFTER INSERT ON joint_refs
+WHEN (SELECT seq FROM hist_context WHERE id = 1) IS NOT NULL
+BEGIN
+    INSERT INTO hist_refs(ref, from_seq, to_seq, uid, kind)
+    VALUES (NEW.ref, (SELECT seq FROM hist_context WHERE id = 1), NULL,
+            NEW.uid, NEW.kind)
+    ON CONFLICT(ref, from_seq) DO UPDATE SET
+        uid = excluded.uid, kind = excluded.kind, to_seq = NULL;
+END;
+
+CREATE TRIGGER IF NOT EXISTS hist_refs_del AFTER DELETE ON joint_refs
+WHEN (SELECT seq FROM hist_context WHERE id = 1) IS NOT NULL
+BEGIN
+    -- a ref opened and dropped inside one batch leaves no trace at all
+    DELETE FROM hist_refs WHERE ref = OLD.ref AND to_seq IS NULL
+      AND from_seq = (SELECT seq FROM hist_context WHERE id = 1);
+    UPDATE hist_refs SET to_seq = (SELECT seq FROM hist_context WHERE id = 1)
+    WHERE ref = OLD.ref AND to_seq IS NULL
+      AND from_seq < (SELECT seq FROM hist_context WHERE id = 1);
+END;
+
 CREATE TABLE IF NOT EXISTS batch_effects (
     batch_id TEXT NOT NULL,
     seq      INTEGER NOT NULL,
@@ -160,4 +296,16 @@ def connect(path: str | os.PathLike, *, read_only: bool = False,
 def init_db(path: str | os.PathLike) -> sqlite3.Connection:
     conn = connect(path)
     conn.executescript(SCHEMA)
+    conn.execute("INSERT OR IGNORE INTO hist_context(id, seq) VALUES(1, NULL)")
     return conn
+
+
+def meta_get(conn, key, default=None):
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def meta_set(conn, key, value):
+    conn.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                 (key, str(value)))

@@ -10,9 +10,16 @@ Endpoints
 ``GET /v1/snapshot``                     current published snapshot summary
 ``GET /v1/batches``                      batches, parts, applied/rejected state
 ``GET /v1/batches/<batch_id>``           one batch: segments, effects
+``GET /v1/history``                      per-batch history build state
 ``GET /v1/trace/upstream?ref=...``       the answer the duty officer needs
-    optional: ``limit`` (default 50000), ``include_retired=1``, ``format=text``
+    optional: ``limit`` (default 50000), ``include_retired=1``, ``format=text``,
+    ``batch=<batch_id>`` (trace as of that published batch)
 ``GET /v1/joint?ref=...``                resolve one reference (alias check)
+    optional: ``batch=<batch_id>`` (resolve with that batch's numbering)
+
+A ``batch`` parameter that names an unknown batch answers 404; a batch that
+is not published, or whose history is still being backfilled, answers 409 --
+never a partial result.
 """
 
 from __future__ import annotations
@@ -22,7 +29,7 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import service, tracing
+from . import history, service, tracing
 
 MAX_TRACE_LIMIT = 500000
 
@@ -91,13 +98,23 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, svc.batch_detail(bid))
                 except KeyError:
                     raise ApiError(404, f"unknown batch {bid!r}")
+            if path == "/v1/history":
+                conn = _ro(self.db_path)
+                try:
+                    return self._send(200, history.status_dict(conn))
+                finally:
+                    conn.close()
             if path == "/v1/joint":
                 ref = self._one(qs, "ref")
                 if not ref:
                     raise ApiError(400, "missing ?ref=")
+                batch = self._one(qs, "batch")
                 conn = _ro(self.db_path)
                 try:
-                    return self._send(200, tracing.resolve_ref(conn, ref))
+                    asof = (tracing.require_history(conn, batch)
+                            if batch else None)
+                    return self._send(200, tracing.resolve_ref(conn, ref,
+                                                               asof=asof))
                 finally:
                     conn.close()
             if path == "/v1/trace/upstream":
@@ -107,6 +124,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(exc.status, {"error": exc.message})
         except tracing.NotFound as exc:
             self._send(404, {"error": str(exc)})
+        except tracing.HistoryNotReady as exc:
+            self._send(409, {"error": str(exc)})
         except tracing.LimitExceeded as exc:
             self._send(413, {"error": str(exc)})
         except Exception:                      # noqa: BLE001
@@ -125,8 +144,10 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "limit must be an integer")
         include_retired = self._one(qs, "include_retired", "0") not in (
             "0", "false", "no", "")
+        batch = self._one(qs, "batch")
         result = tracing.trace_upstream(self.db_path, ref, limit=limit,
-                                        include_retired=include_retired)
+                                        include_retired=include_retired,
+                                        batch=batch)
         if self._one(qs, "format") == "text":
             return self._send(200, render_text(result),
                               ctype="text/plain")
@@ -145,12 +166,13 @@ def render_text(result: dict) -> str:
     q = result["query"]
     t = result["totals"]
     snap = result["snapshot"]
+    asof = "  [历史批次 as-of]" if snap.get("historical") else ""
     lines = [
         f"上游追溯 / upstream trace for {q['ref']}",
         f"  接点 joint   : {q['resolved']['display']}"
         f"  (uid {q['resolved']['uid']}, zone {q['resolved']['zone'] or '-'})",
         f"  快照 snapshot: batch {snap['published_batch']} "
-        f"(seq {snap['applied_seq']}, at {snap['published_at']})",
+        f"(seq {snap['applied_seq']}, at {snap['published_at']}){asof}",
         f"  上游接点 joints: {t['upstream_joints']}   "
         f"上游管段 pipes: {t['upstream_pipes']}   "
         f"最远层数 max depth: {t['max_depth']}",
