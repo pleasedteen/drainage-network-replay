@@ -137,8 +137,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _ro(db_path):
-    from .db import connect
-    return connect(db_path, read_only=True)
+    from .db import connect, network_path
+    return connect(network_path(db_path), read_only=True)
 
 
 def render_text(result: dict) -> str:

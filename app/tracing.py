@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 
-from .db import connect
+from .db import connect, network_path
 from .ids import parse_ref
 
 
@@ -101,9 +101,9 @@ def snapshot_info(conn) -> dict:
         "SELECT CAST(value AS INTEGER) FROM meta WHERE key='applied_seq'"
     ).fetchone()
     applied_seq = applied_seq[0] if applied_seq else 0
-    row = conn.execute("SELECT batch_id,seq,applied_at FROM batches "
-                       "WHERE seq=? AND state='applied'",
-                       (applied_seq,)).fetchone() if applied_seq else None
+    row = conn.execute("SELECT batch_id,seq,applied_at FROM applied_batches "
+                       "WHERE seq=?", (applied_seq,)).fetchone() if applied_seq \
+        else None
     upgrade = conn.execute("SELECT CAST(value AS INTEGER) FROM meta "
                            "WHERE key='upgrade_seq'").fetchone()
     return {
@@ -120,13 +120,13 @@ def snapshot_info(conn) -> dict:
 
 def _seq_batch_map(conn) -> dict[int, str]:
     return {r["seq"]: r["batch_id"] for r in conn.execute(
-        "SELECT seq,batch_id FROM batches")}
+        "SELECT seq,batch_id FROM applied_batches")}
 
 
 def trace_upstream(db_path, ref: str, *, limit: int = 50000,
                    include_retired: bool = False) -> dict:
     """All joints and pipes that can deliver water to ``ref``."""
-    conn = connect(db_path, read_only=True)
+    conn = connect(network_path(db_path), read_only=True)
     try:
         start = resolve_ref(conn, ref)
         start_uid = start["uid"]

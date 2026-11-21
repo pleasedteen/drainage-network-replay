@@ -23,6 +23,13 @@ from . import service, tracing
 
 def _cmd_sync(args):
     svc = service.SyncService(args.db, args.data)
+    # Publish anything that was already complete before this process started.
+    # This is what makes a kill -9 safe: restarting with an *empty* delivery
+    # directory still applies the batches whose segments were all acknowledged,
+    # in order, and keeps missing parts / rejections blocking later batches.
+    recovered = svc.publish()
+    for b in recovered["applied"]:
+        print(f"recovered {b['batch']} (seq {b['seq']})")
     seen = set()
     total = 0
     while True:
@@ -47,6 +54,9 @@ def _cmd_sync(args):
         if not args.watch:
             break
         time.sleep(args.watch)
+    # one last sweep: a segment acknowledged by a concurrent shipper may have
+    # completed the next batch after this process last looked
+    svc.publish()
     status = svc.status()
     print(json.dumps({"accepted": total,
                       "snapshot": status["snapshot"],

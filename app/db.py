@@ -1,12 +1,27 @@
 """SQLite bootstrap: schema, connections, pragmas.
 
-A single database file holds both the append-only sync bookkeeping (landed
-segments, staging rows) and the published network.  That is deliberate: the
-acknowledgement of a segment and the staging rows derived from it commit in
-one transaction, so a ``kill -9`` can never leave the two out of step.
+Storage is split into two database files on purpose:
 
-Readers open the database read-only and WAL lets them keep serving the last
-published batch while a large batch is being applied.
+``<db>`` (the *inbox*)
+    The append-only receive bookkeeping: landed segments, the staging rows
+    derived from them, and per-batch progress.  A segment is acknowledged only
+    after its file, staging rows and segment record commit together here, so a
+    ``kill -9`` can never leave the two out of step.
+
+``<db>.network`` (the *published network*)
+    Joints, pipes, reference aliases and the effect bookkeeping a trace cites.
+    A batch is applied to this file in a single write transaction, so readers
+    only ever see a complete batch.
+
+Keeping them apart is what lets the source keep delivering while a big batch
+is being applied: applying takes a write lock on the network file only, so a
+later segment can still be landed and acknowledged in the inbox.  A trace
+opens the network file read-only and therefore keeps answering from the last
+complete snapshot meanwhile.  WAL also lets readers proceed while either side
+is writing.
+
+``network_path`` derives the network file from the inbox path, so callers that
+know one path can find the other.
 """
 
 from __future__ import annotations
@@ -15,7 +30,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-SCHEMA = """
+INBOX_SCHEMA = """
 CREATE TABLE IF NOT EXISTS batches (
     batch_id       TEXT NOT NULL,
     seq            INTEGER NOT NULL,   -- position in the source's batch order
@@ -48,6 +63,13 @@ CREATE TABLE IF NOT EXISTS segments (
 );
 CREATE INDEX IF NOT EXISTS segments_batch ON segments(batch_id, part);
 
+-- receive-side bookkeeping (rejected_seq; the published position lives in the
+-- network file, which is the authority)
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) WITHOUT ROWID;
+
 -- staging: one row per log item, ordered by (part, item) so a re-ingested
 -- segment always replays in the same order.
 CREATE TABLE IF NOT EXISTS st_ids (
@@ -75,7 +97,9 @@ CREATE TABLE IF NOT EXISTS st_retires (
     kind TEXT NOT NULL, ref TEXT NOT NULL,
     PRIMARY KEY (batch_id, part, item)
 ) WITHOUT ROWID;
+"""
 
+NETWORK_SCHEMA = """
 -- published network
 CREATE TABLE IF NOT EXISTS joints (
     uid         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,12 +139,19 @@ CREATE TABLE IF NOT EXISTS joint_refs (
 CREATE INDEX IF NOT EXISTS joint_refs_kind_uid ON joint_refs(kind, uid);
 CREATE INDEX IF NOT EXISTS joint_refs_uid ON joint_refs(uid);
 
--- what each applied batch actually did; this is what a trace cites as basis.
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 ) WITHOUT ROWID;
 
+-- every batch that made it into this file; a trace cites these as its basis.
+CREATE TABLE IF NOT EXISTS applied_batches (
+    batch_id   TEXT PRIMARY KEY,
+    seq        INTEGER NOT NULL UNIQUE,
+    applied_at TEXT NOT NULL
+);
+
+-- what each applied batch actually did; this is what a trace cites as basis.
 CREATE TABLE IF NOT EXISTS batch_effects (
     batch_id TEXT NOT NULL,
     seq      INTEGER NOT NULL,
@@ -133,8 +164,16 @@ CREATE TABLE IF NOT EXISTS batch_effects (
 """
 
 
+def network_path(path: str | os.PathLike) -> Path:
+    """The published-network file paired with an inbox path (idempotent)."""
+    p = Path(path)
+    if p.name.endswith(".network"):
+        return p
+    return p.with_name(p.name + ".network")
+
+
 def connect(path: str | os.PathLike, *, read_only: bool = False,
-            timeout: float = 30.0) -> sqlite3.Connection:
+            timeout: float = 30.0, busy_timeout: float | None = None) -> sqlite3.Connection:
     p = Path(path)
     if read_only:
         conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=timeout,
@@ -144,7 +183,8 @@ def connect(path: str | os.PathLike, *, read_only: bool = False,
         conn = sqlite3.connect(str(p), timeout=timeout, isolation_level=None,
                                check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=30000")
+    wait_ms = int((timeout if busy_timeout is None else busy_timeout) * 1000)
+    conn.execute(f"PRAGMA busy_timeout={max(wait_ms, 0)}")
     conn.execute("PRAGMA foreign_keys=ON")
     if not read_only:
         conn.execute("PRAGMA journal_mode=WAL")
@@ -157,7 +197,15 @@ def connect(path: str | os.PathLike, *, read_only: bool = False,
     return conn
 
 
-def init_db(path: str | os.PathLike) -> sqlite3.Connection:
+def init_network(path: str | os.PathLike) -> sqlite3.Connection:
     conn = connect(path)
-    conn.executescript(SCHEMA)
+    conn.executescript(NETWORK_SCHEMA)
+    return conn
+
+
+def init_db(path: str | os.PathLike) -> sqlite3.Connection:
+    """Create both files; returns a connection to the inbox."""
+    conn = connect(path)
+    conn.executescript(INBOX_SCHEMA)
+    init_network(network_path(path)).close()
     return conn

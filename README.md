@@ -9,17 +9,22 @@ app/
   jsonstream.py   大日志片段的分块 JSON 读取（单条占位内存，不整体载入）
   ids.py          接点/管段编号语法（旧号 J-000123、片区号 Q4:00123）
   wire.py         日志片段格式校验（整段校验通过才可能被确认）
-  db.py           SQLite 结构与连接（WAL；读连接 mode=ro）
+  db.py           两个 SQLite 文件：收件库（收/暂存）与管网库（已发布），均 WAL
   archive.py      接收：校验 → 落盘（内容寻址）→ 写入暂存表，与"确认"同一次提交
-  snapshot.py     按批次顺序把完整批次应用到已发布管网（单事务、可回滚）
+  snapshot.py     按批次顺序把完整批次应用到已发布管网（管网库单事务、可回滚）
   tracing.py      沿水流方向做上游可达性追溯
   server.py       本地 HTTP 查询
   service.py      进程内编排（接收 → 发布 → 状态）
   replay.py       离线回放源 + 示例数据生成
   __main__.py     命令行：sync / serve / status / trace
-tests/            47 个 unittest 用例（标准库，无需安装）
+tests/            51 个 unittest 用例（标准库，无需安装）
 examples/         demo.py、sample_batches/（示例日志）
 ```
+
+数据库分成两个文件：`DB`（收件库，存放落盘片段、暂存行、批次进度）与
+`DB.network`（管网库，存放接点/管段/别名及追溯所引用的批次效果）。这样做是为了
+让"确认收片"和"应用大批次"互不抢锁：大批次应用只占管网库的写锁，后到的有效分片
+仍能在收件库落盘并独立确认，查询始终读取最近一次完整发布的管网。
 
 ## 1. 启动
 
@@ -94,10 +99,20 @@ timeout 80 python3 examples/demo.py
 
 * 每个片段独立确认。确认 = 该片段的**落盘文件 + 暂存行 + 片段记录**在同一次 SQLite
   事务里提交；提交之后源端即可清理副本。
+* 确认与发布**互不阻塞**：确认只写收件库，应用大批次只写管网库。因此大批次正在应用
+  时，后到的有效分片仍能落盘并独立确认；此时这次投递自己触发的发布若遇到管网库被
+  占用，会以 `stopped.reason="busy"` 返回而**不影响已经落地的确认**，由下一次发布
+  （本进程、另一台传输进程或重启后的进程）补上（`test_publish_decoupled.py::
+  test_ack_while_paused_then_kill_and_republish`）。
 * 进程在提交后立刻被 `kill -9`：重启后该片段仍是"已确认"，不会要求重传
   （`tests/test_receive.py::test_ack_survives_hard_kill_and_restart`）。
 * 进程在提交前被杀死：事务回滚，暂存表和片段记录都不存在，源端重传即可
   （`test_crash_during_staging_leaves_no_partial_state`）。
+* 应用中途 `kill -9`：管网库事务整体回滚，已确认的分片与暂存行仍在；重启后即使
+  投递目录为空，也会按顺序把已收齐的批次发布出去（`sync` 启动时先补发布）。
+  管网库的 `applied_seq` 是权威，收件库的批次状态由它校正，因此"管网已提交、收件库
+  尚未标记"的崩溃窗口重启后也会显示为 `applied`（`test_publish_decoupled.py::
+  test_published_batch_reported_even_if_inbox_lags`）。
 * 重复投递：按**内容摘要**去重——字节相同、或字节不同但内容等价（如缩进不同）都
   回答 `duplicate` 且 `acknowledged=false`，不重复写入。
 * 片段可乱序到达；同一批次可以等多片到齐才发布。并发投递安全
@@ -106,12 +121,16 @@ timeout 80 python3 examples/demo.py
 ## 5. 按批次生效
 
 * 只有"下一顺位"的批次完整（`parts` 全部到齐，`total` 给出源端批次数）才会被应用。
-* 应用在**一个写事务**内完成；读连接永远看不到半个批次。
+* 应用只对**管网库**开一个写事务，收件库不受影响；读连接永远看不到半个批次，后到的
+  有效分片也照常在第 4 节所述的独立路径上确认。
 * 应用失败（数据与已有管网矛盾，例如管段指向不存在的接点）→ 回滚并标记
   `rejected`，保留错误原因；**上一次完整发布的管网继续可查**，后续批次被阻塞直到
-  人工处理（`status` 会给出 blocker）。
+  人工处理（`status` 会给出 blocker）。缺片同理挡住后续批次
+  （`test_publish_decoupled.py::test_missing_part_or_rejection_still_blocks_later_publish`）。
 * 有未完成批次时，查询照常返回最近一次完整发布的结果，响应里标明
   `snapshot.published_batch`（`test_queries_stay_available_while_a_big_batch_is_applied`）。
+  若有发布者正在应用，`publish_blocker.reason` 为 `applying`；若管网库写锁被占，
+  该次发布返回 `busy`，均不改变已发布内容。
 
 ## 6. 新老编号并存
 
@@ -173,10 +192,12 @@ X 或 X 上游的**在用**管段；已停用管段不参与（不计入结果�
 ## 9. 测试
 
 ```bash
-python3 tests/run_all.py            # 47 个用例，约 10 秒
+python3 tests/run_all.py            # 51 个用例，约 10 秒
 python3 tests/run_all.py 2>/dev/null | tail -3
 ```
 
 覆盖面：乱序/重复/冲突片段、非法 JSON 与非法字段、`kill -9` 后恢复、发布中途失败回滚、
 超大批次（4 万接点+4 万管段、约 7 MB）在 96 MiB 数据段上限下接收并应用、应用期间并发查询、
-新旧编号等价、改向/停用的追溯语义、HTTP 状态码、离线回放与命令行全流程。
+**应用已写入部分变更时暂停、期间后续分片独立确认、随即强停重启后从空投递目录按序补发布**
+（`tests/test_publish_decoupled.py`）、新旧编号等价、改向/停用的追溯语义、HTTP 状态码、
+离线回放与命令行全流程。
