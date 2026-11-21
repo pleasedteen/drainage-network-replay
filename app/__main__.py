@@ -75,7 +75,8 @@ def _cmd_status(args):
     if not Path(args.db).exists():
         print(f"no database at {args.db}: run `sync` first", file=sys.stderr)
         return 2
-    svc = service.SyncService(args.db, args.data or Path(args.db).parent / "data")
+    svc = service.SyncService(args.db, args.data or Path(args.db).parent / "data",
+                              resume_publish=False)
     print(json.dumps(svc.status(), ensure_ascii=False, indent=1))
     return 0
 

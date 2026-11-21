@@ -1,15 +1,24 @@
-"""Receiving segments: content-addressed landing plus SQLite staging.
+"""Receiving segments: content-addressed landing plus staging.
 
 A segment that passes validation is
 
 1. stored byte-for-byte under ``<data>/segments/`` (content-addressed, so a
-   repeated delivery of the identical bytes costs one hash), and
-2. replayed a second time into the ``st_*`` staging tables, inside the *same*
-   transaction that records the segment row.
+   repeated delivery of the identical bytes costs one hash),
+2. replayed a second time into the ``st_*`` staging tables, in short
+   transactions (``STAGE_CHUNK_ROWS`` items per commit), and
+3. recorded, together with its batch bookkeeping, in one short transaction.
 
-Only after that transaction commits does the receiver answer ``accepted`` --
-i.e. the source may drop its copy.  A crash before the commit rolls back both
-the staging rows and the segment record, so redelivery is always safe.
+Only step 3 -- the acknowledgement -- lets the source drop its copy.  The
+receive/staging file is separate from the published-network file (see ``db``),
+and applying a batch touches only the latter, so acknowledging a small
+segment is never stuck behind a large batch that is being applied.  The
+staging pass commits in short chunks for the same reason: a small delivery
+gets the staging write lock between a large delivery's chunks.
+
+A crash before the acknowledgement leaves at most unacknowledged staging rows.
+Redelivery clears any rows for the same (batch, part) before restaging, so a
+retry always starts from a clean slate -- ``kill -9`` can never leave a
+segment acknowledged without its rows, nor rows without its segment.
 
 A large segment is never held in memory: it is streamed item by item into
 SQLite staging rows from the on-disk copy.  Both passes read the file from
@@ -30,17 +39,23 @@ from . import jsonstream, wire
 from .db import connect
 
 INSERT_SQL = {
-    "ids": "INSERT INTO st_ids(batch_id,part,item,old_ref,new_ref) "
+    "ids": "INSERT OR REPLACE INTO st_ids(batch_id,part,item,old_ref,new_ref) "
            "VALUES(?,?,?,?,?)",
-    "taps": "INSERT INTO st_taps(batch_id,part,item,ref,zone,local,attrs) "
-            "VALUES(?,?,?,?,?,?,?)",
-    "lays": "INSERT INTO st_lays(batch_id,part,item,code,from_ref,to_ref,"
+    "taps": "INSERT OR REPLACE INTO st_taps(batch_id,part,item,ref,zone,local,"
             "attrs) VALUES(?,?,?,?,?,?,?)",
-    "redirects": "INSERT INTO st_redirects(batch_id,part,item,kind,code,"
-                 "from_ref,to_ref) VALUES(?,?,?,?,?,?,?)",
-    "retires": "INSERT INTO st_retires(batch_id,part,item,kind,ref) "
+    "lays": "INSERT OR REPLACE INTO st_lays(batch_id,part,item,code,from_ref,"
+            "to_ref,attrs) VALUES(?,?,?,?,?,?,?)",
+    "redirects": "INSERT OR REPLACE INTO st_redirects(batch_id,part,item,kind,"
+                 "code,from_ref,to_ref) VALUES(?,?,?,?,?,?,?)",
+    "retires": "INSERT OR REPLACE INTO st_retires(batch_id,part,item,kind,ref) "
                "VALUES(?,?,?,?,?)",
 }
+
+# items carried by one staging commit: keeps each write lock short and the WAL
+# bounded, so a concurrent small delivery is never starved for a whole segment
+STAGE_CHUNK_ROWS = 2000
+
+
 class LandError(wire.SegmentError):
     """A segment that cannot be acknowledged for a reason other than shape."""
 
@@ -132,27 +147,52 @@ def _scan(path: Path, *, chunk_size: int) -> _Scan:
 
 
 def _stage(path: Path, scan: _Scan, conn, *, chunk_size: int) -> None:
-    """Pass 2: stream validated items into staging rows."""
+    """Pass 2: stream validated items into staging rows, in short commits.
+
+    ``conn`` is the receive connection.  Rows already present for this
+    (batch, part) -- debris from a crashed earlier attempt -- are cleared
+    first, so a retry always starts from a clean slate.
+    """
+    batch, part = scan.header.batch, scan.header.part
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for name in wire.SEGMENT_ARRAYS:
+            conn.execute(f"DELETE FROM st_{name} WHERE batch_id=? AND part=?",
+                         (batch, part))
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+
     counters = {name: 0 for name in wire.SEGMENT_ARRAYS}
+    pending = []
+
+    def flush():
+        if not pending:
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for section, idx, row in pending:
+                conn.execute(INSERT_SQL[section], (batch, part, idx, *row))
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        pending.clear()
 
     def on_field(key, value):
         pass
-
-    pending = []
 
     def on_item(section, item):
         idx = counters[section]
         row = wire.validate_item(section, item, idx)
         pending.append((section, idx, row))
         counters[section] = idx + 1
-        if len(pending) >= 500:
+        if len(pending) >= STAGE_CHUNK_ROWS:
             flush()
-
-    def flush():
-        for section, idx, row in pending:
-            conn.execute(INSERT_SQL[section],
-                         (scan.header.batch, scan.header.part, idx, *row))
-        pending.clear()
 
     try:
         with open(path, "rb") as fp:
@@ -278,10 +318,12 @@ def land_segment(db_path, data_dir, source_path, *, chunk_size: int = 65536,
             else:
                 final = src
 
+        _stage(final if copy else src, scan, conn, chunk_size=chunk_size)
+
         conn.execute("BEGIN IMMEDIATE")
         try:
             # re-check under the write lock: another receiver may have
-            # committed the same segment while this one was scanning
+            # committed the same segment while this one was staging
             row = _existing_row(conn, header.segment, scan.digest)
             if row is not None:
                 conn.execute("ROLLBACK")
@@ -309,11 +351,10 @@ def land_segment(db_path, data_dir, source_path, *, chunk_size: int = 65536,
                 "ON CONFLICT(batch_id) DO NOTHING",
                 (header.batch, header.seq, header.total, int(header.upgrade),
                  parts_expected, _now()))
-            _stage(final if copy else src, scan, conn, chunk_size=chunk_size)
             conn.execute(
                 "INSERT INTO segments(seg_id, sha256, batch_id, part, parts, "
                 "seq, total, upgrade, nbytes, path, received_at, ingested) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,'validated')",
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,1)",
                 (header.segment, scan.digest, header.batch, header.part,
                  header.parts, header.seq, header.total, int(header.upgrade),
                  nbytes, str(final.relative_to(data)) if copy else str(final),
@@ -338,7 +379,15 @@ def land_segment(db_path, data_dir, source_path, *, chunk_size: int = 65536,
         conn.close()
 
 
-def batch_status(conn, batch_id: str) -> dict | None:
+def batch_status(conn, batch_id: str, published=None) -> dict | None:
+    """Batch summary from the receive file, merged with the published ledger.
+
+    ``published`` is an optional connection to the published file.  The
+    receive file deliberately keeps every batch ``staging`` -- it is never
+    rewritten by a publisher, so the long apply cannot block an
+    acknowledgement -- and the authoritative applied/rejected state lives in
+    the published ledger.
+    """
     row = conn.execute("SELECT * FROM batches WHERE batch_id=?",
                        (batch_id,)).fetchone()
     if row is None:
@@ -346,13 +395,21 @@ def batch_status(conn, batch_id: str) -> dict | None:
     parts = [r["part"] for r in conn.execute(
         "SELECT DISTINCT part FROM segments WHERE batch_id=? ORDER BY part",
         (batch_id,))]
+    state, error, applied_at = row["state"], row["error"], row["applied_at"]
+    if published is not None:
+        led = published.execute("SELECT state,error,applied_at "
+                                "FROM published_batches WHERE batch_id=?",
+                                (batch_id,)).fetchone()
+        if led is not None:
+            state, error, applied_at = led["state"], led["error"], led["applied_at"]
     return {
         "batch": row["batch_id"],
         "seq": row["seq"],
         "total": row["total"],
         "upgrade": bool(row["upgrade"]),
-        "state": row["state"],
-        "error": row["error"],
+        "state": state,
+        "error": error,
+        "applied_at": applied_at,
         "parts_expected": row["parts_expected"],
         "parts_received": sorted(parts),
         "complete": len(parts) == row["parts_expected"],

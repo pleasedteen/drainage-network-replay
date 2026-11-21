@@ -48,9 +48,14 @@ class PublishTest(TempDirTest):
             svc.accept(p)
         self.assertIsNone(svc.status()["snapshot"]["published_batch"])
 
+        # a fresh service resumes publishing on startup, so a kill -9 between
+        # acknowledgement and publish cannot strand a staged batch
         restarted = service.SyncService(self.work / "drain.db",
                                         self.work / "data")
-        self.assertEqual(restarted.publish()["applied"][0]["batch"], "B-0001")
+        self.assertEqual(restarted.status()["snapshot"]["published_batch"],
+                         "B-0001")
+        # an explicit publish is a harmless no-op afterwards
+        self.assertEqual(restarted.publish()["applied"], [])
         res = tracing.trace_upstream(restarted.db_path, "J-000002")
         self.assertEqual(res["totals"]["upstream_pipes"], 1)
 

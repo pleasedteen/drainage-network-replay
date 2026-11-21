@@ -1,8 +1,14 @@
 """Applying a complete batch to the published network.
 
-Batches are applied strictly in ``seq`` order, one at a time, each inside a
-single write transaction.  Readers therefore only ever see the network as of
-the end of some batch -- a half-applied batch is never visible.  A batch whose
+The staging rows live in the receive database; the published network lives in
+its own file (see ``db``).  A publisher opens the published file, attaches the
+receive file read-only as ``rcv``, and reads staged items from ``rcv.st_*``
+while it writes joints/pipes to the published file.  The whole apply is one
+write transaction on the published file, so readers never see a half-applied
+batch -- and, crucially, the receive file's write lock is *not* held for the
+duration of the apply, so another delivery can still be acknowledged.
+
+Batches are applied strictly in ``seq`` order, one at a time.  A batch whose
 data conflicts with the published network is rolled back *and retired*: it
 keeps its ``rejected`` state plus an error, blocks later batches, and the last
 good snapshot stays queryable.
@@ -23,6 +29,10 @@ import sqlite3
 import time
 
 from .ids import parse_ref
+
+# receive-database schema prefix, valid because publishers ATTACH the receive
+# file under this name before calling in
+R = "rcv."
 
 
 class ApplyError(ValueError):
@@ -45,31 +55,41 @@ def meta_set(conn, key, value):
 
 
 # ---------------------------------------------------------------------------
-# readiness
+# readiness (receive file is attached read-only as ``rcv``)
 # ---------------------------------------------------------------------------
 
+def _published_state(conn, seq: int):
+    return conn.execute("SELECT state,error FROM published_batches WHERE seq=?",
+                        (seq,)).fetchone()
+
+
 def batch_ready(conn, row) -> bool:
-    if row["state"] != "staging":
-        return False
     parts = [r[0] for r in conn.execute(
-        "SELECT DISTINCT part FROM segments WHERE batch_id=?", (row["batch_id"],))]
+        f"SELECT DISTINCT part FROM {R}segments WHERE batch_id=?",
+        (row["batch_id"],))]
     return (len(parts) == row["parts_expected"]
             and sorted(parts) == list(range(row["parts_expected"])))
 
 
 def next_batch_to_apply(conn):
+    """The next batch in source order, if it is complete and unpublished.
+
+    Returns one of ``None`` (nothing to do), ``("apply", row)`` or
+    ``("rejected", row, error)``.
+    """
     applied = int(meta_get(conn, "applied_seq", 0))
-    rejected = meta_get(conn, "rejected_seq")
-    row = conn.execute(
-        "SELECT * FROM batches WHERE seq=? AND state IN ('staging','rejected')",
-        (applied + 1,)).fetchone()
+    seq = applied + 1
+    row = conn.execute(f"SELECT * FROM {R}batches WHERE seq=?", (seq,)).fetchone()
     if row is None:
         return None
-    if row["state"] == "rejected" or rejected == row["seq"]:
-        return row                      # caller reports the block, does not apply
+    led = _published_state(conn, seq)
+    if led is not None:
+        if led["state"] == "rejected":
+            return ("rejected", row, led["error"])
+        return None                     # already applied; nothing to do
     if not batch_ready(conn, row):
         return None
-    return row
+    return ("apply", row)
 
 
 # ---------------------------------------------------------------------------
@@ -171,9 +191,8 @@ def resolve_existing(conn, ref: str, what: str, seq: int) -> int:
 
 def _rows(conn, table, batch_id):
     """Stream staged items of one section in a stable order."""
-    order = {"st_ids": "part, item", "st_taps": "part, item"}
-    return conn.execute(f"SELECT * FROM {table} WHERE batch_id=? "
-                        f"ORDER BY {order.get(table, 'part, item')}", (batch_id,))
+    return conn.execute(f"SELECT * FROM {R}{table} WHERE batch_id=? "
+                        f"ORDER BY part, item", (batch_id,))
 
 
 def _effect(effects, kind, n=1):
@@ -346,8 +365,11 @@ def apply_batch(conn, row) -> dict:
         if n:
             conn.execute("INSERT INTO batch_effects(batch_id,seq,kind,n) "
                          "VALUES(?,?,?,?)", (batch_id, seq, kind, n))
-    conn.execute("UPDATE batches SET state='applied', applied_at=?, error=NULL "
-                 "WHERE batch_id=?", (_now(), batch_id))
+    conn.execute("INSERT INTO published_batches(seq, batch_id, state, error, "
+                 "applied_at) VALUES(?,?,'applied',NULL,?) "
+                 "ON CONFLICT(seq) DO UPDATE SET state='applied', error=NULL, "
+                 "applied_at=excluded.applied_at",
+                 (seq, batch_id, _now()))
     meta_set(conn, "applied_seq", seq)
     return effects
 
@@ -355,25 +377,31 @@ def apply_batch(conn, row) -> dict:
 def publish_ready(conn, *, max_batches=None) -> dict:
     """Apply every batch that is complete and next in line.
 
+    ``conn`` is the *published* connection, with the receive file attached
+    (read-only) as ``rcv``.  Each apply is one write transaction on the
+    published file; the receive file's write lock is never taken, so a
+    concurrent delivery can still be acknowledged.
+
     Returns a report: which batches were applied, and why publishing stopped.
     Safe against several publishers: the applicability check is repeated
-    under the write lock, so a batch another process already applied is simply
-    skipped rather than being mistaken for a conflict.
+    under the published write lock, so a batch another process already applied
+    is simply skipped rather than being mistaken for a conflict.
     """
     applied, stopped = [], None
     n = 0
     while max_batches is None or n < max_batches:
-        row = next_batch_to_apply(conn)
-        if row is None:
+        nxt = next_batch_to_apply(conn)
+        if nxt is None:
             break
-        if row["state"] == "rejected":
-            stopped = {"reason": "rejected", "batch": row["batch_id"],
-                       "seq": row["seq"], "error": row["error"]}
+        if nxt[0] == "rejected":
+            stopped = {"reason": "rejected", "batch": nxt[1]["batch_id"],
+                       "seq": nxt[1]["seq"], "error": nxt[2]}
             break
+        row = nxt[1]
         conn.execute("BEGIN IMMEDIATE")
-        fresh = conn.execute("SELECT * FROM batches WHERE batch_id=?",
+        fresh = conn.execute(f"SELECT * FROM {R}batches WHERE batch_id=?",
                              (row["batch_id"],)).fetchone()
-        if (fresh is None or fresh["state"] != "staging"
+        if (fresh is None or _published_state(conn, row["seq"]) is not None
                 or not batch_ready(conn, fresh)):
             conn.execute("ROLLBACK")
             continue
@@ -383,15 +411,18 @@ def publish_ready(conn, *, max_batches=None) -> dict:
         except ApplyError as exc:
             conn.execute("ROLLBACK")
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute("UPDATE batches SET state='rejected', error=? "
-                         "WHERE batch_id=?", (str(exc), row["batch_id"]))
+            conn.execute("INSERT INTO published_batches(seq, batch_id, state, "
+                         "error, applied_at) VALUES(?,?,'rejected',?,NULL) "
+                         "ON CONFLICT(seq) DO UPDATE SET state='rejected', "
+                         "error=excluded.error",
+                         (row["seq"], row["batch_id"], str(exc)))
             meta_set(conn, "rejected_seq", row["seq"])
             conn.execute("COMMIT")
             stopped = {"reason": "rejected", "batch": row["batch_id"],
                        "seq": row["seq"], "error": str(exc)}
             break
         except sqlite3.Error:
-            # storage-level failure: leave the batch staged so it can be
+            # storage-level failure: leave the batch unpublished so it can be
             # retried after a restart instead of being rejected for good
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
@@ -409,31 +440,32 @@ def publish_ready(conn, *, max_batches=None) -> dict:
 def _blocker(conn):
     """Describe why the next batch cannot be published yet."""
     applied_seq = int(meta_get(conn, "applied_seq", 0))
-    nxt = conn.execute("SELECT * FROM batches WHERE seq=?",
+    nxt = conn.execute(f"SELECT * FROM {R}batches WHERE seq=?",
                        (applied_seq + 1,)).fetchone()
     if nxt is None:
         waiting = conn.execute(
-            "SELECT batch_id, seq, parts_expected, parts_received FROM batches "
+            f"SELECT batch_id, seq, parts_expected FROM {R}batches "
             "WHERE seq>? ORDER BY seq LIMIT 1", (applied_seq + 1,)).fetchone()
         if waiting is None:
             return {"reason": "up_to_date"}
         missing = sorted(set(range(waiting["parts_expected"]))
                          - set(r[0] for r in conn.execute(
-                             "SELECT DISTINCT part FROM segments WHERE "
+                             f"SELECT DISTINCT part FROM {R}segments WHERE "
                              "batch_id=?", (waiting["batch_id"],))))
         if missing and applied_seq + 1 == waiting["seq"]:
             return {"reason": "waiting_for_parts", "batch": waiting["batch_id"],
                     "seq": waiting["seq"], "missing_parts": missing}
         return {"reason": "waiting_for_earlier_batch",
                 "batch": waiting["batch_id"], "seq": waiting["seq"]}
+    led = _published_state(conn, nxt["seq"])
+    if led is not None and led["state"] == "rejected":
+        return {"reason": "rejected", "batch": nxt["batch_id"],
+                "seq": nxt["seq"], "error": led["error"]}
     missing = sorted(set(range(nxt["parts_expected"]))
                      - set(r[0] for r in conn.execute(
-                         "SELECT DISTINCT part FROM segments WHERE batch_id=?",
+                         f"SELECT DISTINCT part FROM {R}segments WHERE batch_id=?",
                          (nxt["batch_id"],))))
     if missing:
         return {"reason": "waiting_for_parts", "batch": nxt["batch_id"],
                 "seq": nxt["seq"], "missing_parts": missing}
-    if nxt["state"] == "rejected":
-        return {"reason": "rejected", "batch": nxt["batch_id"],
-                "seq": nxt["seq"], "error": nxt["error"]}
     return {"reason": "unknown", "batch": nxt["batch_id"], "seq": nxt["seq"]}

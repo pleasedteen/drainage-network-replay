@@ -81,12 +81,14 @@ class Handler(BaseHTTPRequestHandler):
                     conn.close()
             if path == "/v1/batches":
                 svc = service.SyncService(self.db_path, self._data_dir(),
-                                          auto_publish=False)
+                                          auto_publish=False,
+                                          resume_publish=False)
                 return self._send(200, svc.status())
             if path.startswith("/v1/batches/"):
                 bid = unquote(path[len("/v1/batches/"):])
                 svc = service.SyncService(self.db_path, self._data_dir(),
-                                          auto_publish=False)
+                                          auto_publish=False,
+                                          resume_publish=False)
                 try:
                     return self._send(200, svc.batch_detail(bid))
                 except KeyError:
@@ -137,8 +139,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _ro(db_path):
-    from .db import connect
-    return connect(db_path, read_only=True)
+    from .db import connect, published_path
+    return connect(published_path(db_path), read_only=True)
 
 
 def render_text(result: dict) -> str:
@@ -176,6 +178,10 @@ def render_text(result: dict) -> str:
 
 def make_server(db_path, data_dir="", host="127.0.0.1", port=0,
                 quiet=True) -> ThreadingHTTPServer:
+    # make sure the (empty) published file exists so read-only queries answer
+    # with "no snapshot yet" instead of "unable to open database file"
+    from .db import init_db
+    init_db(db_path).close()
     handler = type("BoundHandler", (Handler,), {"db_path": str(db_path)})
     srv = ThreadingHTTPServer((host, port), handler)
     srv.data_dir = str(data_dir)

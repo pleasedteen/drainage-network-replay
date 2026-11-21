@@ -1,12 +1,27 @@
 """SQLite bootstrap: schema, connections, pragmas.
 
-A single database file holds both the append-only sync bookkeeping (landed
-segments, staging rows) and the published network.  That is deliberate: the
-acknowledgement of a segment and the staging rows derived from it commit in
-one transaction, so a ``kill -9`` can never leave the two out of step.
+Two database files, deliberately:
 
-Readers open the database read-only and WAL lets them keep serving the last
-published batch while a large batch is being applied.
+``<db>``            append-only receive bookkeeping: landed segments, staging
+                    rows derived from them, batch declarations.  A segment's
+                    acknowledgement and its staging rows commit in *this*
+                    file, in short transactions, so a ``kill -9`` can never
+                    leave the two out of step.
+``<db>.published``  the published network (joints, pipes, references, batch
+                    effects).  Applying a complete batch is one long write
+                    transaction here.
+
+Keeping them apart is what makes a small segment deliverable while a huge
+batch is being applied: the apply holds the write lock on the published file
+only, so an acknowledgement still commits to the receive file within
+milliseconds.  The staging pass itself is written in short chunk transactions
+(see ``archive._stage``) so a delivery also gets the receive write lock while
+a huge segment is still being staged.  Readers open the published file
+read-only; WAL lets them keep serving the last complete batch for the whole
+apply.
+
+``init_db`` creates both files.  ``published_path`` derives the second path
+from the first, so callers only ever name one database.
 """
 
 from __future__ import annotations
@@ -15,7 +30,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-SCHEMA = """
+MAIN_SCHEMA = """
 CREATE TABLE IF NOT EXISTS batches (
     batch_id       TEXT NOT NULL,
     seq            INTEGER NOT NULL,   -- position in the source's batch order
@@ -49,7 +64,8 @@ CREATE TABLE IF NOT EXISTS segments (
 CREATE INDEX IF NOT EXISTS segments_batch ON segments(batch_id, part);
 
 -- staging: one row per log item, ordered by (part, item) so a re-ingested
--- segment always replays in the same order.
+-- segment always replays in the same order.  Only segments with ingested=1
+-- count as received; a torn staging pass leaves ingested=0 and is redone.
 CREATE TABLE IF NOT EXISTS st_ids (
     batch_id TEXT NOT NULL, part INTEGER NOT NULL, item INTEGER NOT NULL,
     old_ref TEXT NOT NULL, new_ref TEXT NOT NULL,
@@ -75,7 +91,9 @@ CREATE TABLE IF NOT EXISTS st_retires (
     kind TEXT NOT NULL, ref TEXT NOT NULL,
     PRIMARY KEY (batch_id, part, item)
 ) WITHOUT ROWID;
+"""
 
+PUBLISHED_SCHEMA = """
 -- published network
 CREATE TABLE IF NOT EXISTS joints (
     uid         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,12 +133,23 @@ CREATE TABLE IF NOT EXISTS joint_refs (
 CREATE INDEX IF NOT EXISTS joint_refs_kind_uid ON joint_refs(kind, uid);
 CREATE INDEX IF NOT EXISTS joint_refs_uid ON joint_refs(uid);
 
--- what each applied batch actually did; this is what a trace cites as basis.
+-- published state: applied_seq / applied batch, upgrade point, rejection.
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 ) WITHOUT ROWID;
 
+-- the source-order ledger of batches that reached the published snapshot;
+-- this is what a trace uses to name the batch behind every element.
+CREATE TABLE IF NOT EXISTS published_batches (
+    seq        INTEGER PRIMARY KEY,
+    batch_id   TEXT NOT NULL UNIQUE,
+    state      TEXT NOT NULL,             -- applied | rejected
+    error      TEXT,
+    applied_at TEXT
+);
+
+-- what each applied batch actually did; this is what a trace cites as basis.
 CREATE TABLE IF NOT EXISTS batch_effects (
     batch_id TEXT NOT NULL,
     seq      INTEGER NOT NULL,
@@ -131,6 +160,11 @@ CREATE TABLE IF NOT EXISTS batch_effects (
     PRIMARY KEY (batch_id, kind)
 ) WITHOUT ROWID;
 """
+
+
+def published_path(path: str | os.PathLike) -> Path:
+    """The published-network file that belongs to a receive database."""
+    return Path(str(path) + ".published")
 
 
 def connect(path: str | os.PathLike, *, read_only: bool = False,
@@ -144,7 +178,7 @@ def connect(path: str | os.PathLike, *, read_only: bool = False,
         conn = sqlite3.connect(str(p), timeout=timeout, isolation_level=None,
                                check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute(f"PRAGMA busy_timeout={max(1, int(timeout * 1000))}")
     conn.execute("PRAGMA foreign_keys=ON")
     if not read_only:
         conn.execute("PRAGMA journal_mode=WAL")
@@ -158,6 +192,12 @@ def connect(path: str | os.PathLike, *, read_only: bool = False,
 
 
 def init_db(path: str | os.PathLike) -> sqlite3.Connection:
+    """Create (if needed) both database files; return the receive connection."""
     conn = connect(path)
-    conn.executescript(SCHEMA)
+    conn.executescript(MAIN_SCHEMA)
+    pub = connect(published_path(path))
+    try:
+        pub.executescript(PUBLISHED_SCHEMA)
+    finally:
+        pub.close()
     return conn

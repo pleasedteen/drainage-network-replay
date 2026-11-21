@@ -193,6 +193,70 @@ class ReceivingTest(TempDirTest):
         self.assertEqual(svc.accept(seg)["status"], "accepted")
         self.assertEqual(svc.status()["snapshot"]["joints"], 2000)
 
+    def test_crash_mid_staging_is_retried_from_a_clean_slate(self):
+        """Short chunk commits mean a hard exit can leave orphan staging rows
+        in the (separate) receive file, but no segment record.  Retrying the
+        same segment must clear the orphans and stage exactly once."""
+        db, data = self.work / "drain.db", self.work / "data"
+        seg = self.write_batch("B-0001", 1, 1, items=basic_items(1, 6000))[0]
+
+        script = textwrap.dedent(f"""
+            import os, sys; sys.path.insert(0, {str(ROOT)!r})
+            from app import service, archive
+            armed = [False]
+            _stage = archive._stage
+            def stage(path, scan, conn, **kw):
+                armed[0] = True
+                return _stage(path, scan, conn, **kw)
+            archive._stage = stage
+            _iter = archive.jsonstream.iter_segment
+            def it(fp, **kw):
+                on = kw.get("on_array_item")
+                seen = [0]
+                def wrapped(section, item):
+                    on(section, item)
+                    if armed[0]:
+                        seen[0] += 1
+                        if seen[0] >= 4500:      # several chunks already committed
+                            os._exit(9)
+                kw["on_array_item"] = wrapped
+                return _iter(fp, **kw)
+            archive.jsonstream.iter_segment = it
+            svc = service.SyncService({str(db)!r}, {str(data)!r},
+                                      auto_publish=False)
+            svc.accept({str(seg)!r})
+        """)
+        proc = subprocess.run([sys.executable, "-I", "-c", script],
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 9, proc.stderr[-2000:])
+
+        conn = sqlite3.connect(db)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0], 0)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM batches").fetchone()[0], 0)
+            orphan = conn.execute("SELECT COUNT(*) FROM st_taps").fetchone()[0]
+            self.assertGreater(orphan, 0)     # debris from the killed staging
+        finally:
+            conn.close()
+
+        svc = service.SyncService(db, data, resume_publish=False)
+        out = svc.accept(seg)
+        self.assertEqual(out["status"], "accepted")
+        svc.publish()
+        st = svc.status()
+        self.assertEqual(st["snapshot"]["published_batch"], "B-0001")
+        self.assertEqual(st["snapshot"]["joints"], 6000)
+        conn = sqlite3.connect(db)
+        try:
+            # cleared and restaged once -- no duplicated leftover rows
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM st_taps").fetchone()[0],
+                6000)
+        finally:
+            conn.close()
+
     def test_rejection_blocks_later_batches_but_keeps_snapshot(self):
         svc = self.make_svc()
         self.write_batch("B-0001", 1, 3, items=basic_items(1, 4))
