@@ -5,9 +5,13 @@
     python -m app status --db DB
     python -m app trace  --db DB --ref REF [--format text|json]
 
-``sync --from-source`` replays every ``*.json`` segment in a directory (the
-offline replay source's delivery folder); ``--watch`` keeps polling it so
-segments that arrive later are picked up too.
+``sync --from-source`` replays the segment files of its source directory
+(the offline replay source's delivery folder).  A directory managed by the
+generator (one with a ``.samples/manifest.json``) contributes exactly the
+version selected when the sync run starts -- regenerating a new version
+mid-run does not switch the run to it, and unrelated JSON files are never
+delivered.  A bare directory keeps the original behaviour: every ``*.json``
+in it is delivered, and ``--watch`` keeps picking up new files.
 """
 
 from __future__ import annotations
@@ -18,35 +22,36 @@ import sys
 import time
 from pathlib import Path
 
-from . import service, tracing
+from . import sample_store, service, tracing
 
 
 def _cmd_sync(args):
     svc = service.SyncService(args.db, args.data)
     seen = set()
     total = 0
-    while True:
-        paths = sorted(Path(args.from_source).glob("*.json"))
-        for p in paths:
-            key = (p.name, p.stat().st_mtime_ns, p.stat().st_size)
-            if key in seen:
-                continue
-            seen.add(key)
-            try:
-                out = svc.accept(p)
-            except Exception as exc:  # noqa: BLE001
-                # nothing is acknowledged, so the source keeps its copy and
-                # can fix and resend; keep replaying the rest of the folder
-                print(f"REJECTED {p.name}: {exc}", file=sys.stderr)
-                continue
-            total += 1
-            pub = out.get("publish") or {}
-            applied = ",".join(b["batch"] for b in pub.get("applied", [])) or "-"
-            print(f"{out['status']:9s} {out['segment']} batch={out['batch']} "
-                  f"part={out['part']}/{out['parts']} applied={applied}")
-        if not args.watch:
-            break
-        time.sleep(args.watch)
+    with sample_store.open_source(args.from_source) as source:
+        while True:
+            paths = source.current_paths()
+            for p in paths:
+                key = (p.name, p.stat().st_mtime_ns, p.stat().st_size)
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    out = svc.accept(p)
+                except Exception as exc:  # noqa: BLE001
+                    # nothing is acknowledged, so the source keeps its copy and
+                    # can fix and resend; keep replaying the rest of the folder
+                    print(f"REJECTED {p.name}: {exc}", file=sys.stderr)
+                    continue
+                total += 1
+                pub = out.get("publish") or {}
+                applied = ",".join(b["batch"] for b in pub.get("applied", [])) or "-"
+                print(f"{out['status']:9s} {out['segment']} batch={out['batch']} "
+                      f"part={out['part']}/{out['parts']} applied={applied}")
+            if not args.watch:
+                break
+            time.sleep(args.watch)
     status = svc.status()
     print(json.dumps({"accepted": total,
                       "snapshot": status["snapshot"],

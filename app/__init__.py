@@ -11,6 +11,9 @@ Layering
                    bookkeeping, swapped in only when a batch is complete.
 * ``tracing``   -- upstream reachability over the published snapshot.
 * ``server``    -- the local HTTP query API.
+* ``sample_store`` -- versioned sample sets: atomic regeneration, user files
+                   preserved, one version selected per replay, stale sets
+                   reaped while in-flight replays stay readable.
 * ``replay``    -- offline source-log replay used by the demo and tests.
 """
 

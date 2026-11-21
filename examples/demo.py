@@ -35,9 +35,16 @@ def main():
     print("=" * 78)
     print("1. offline replay source writes its segment files")
     src = work / "source"
+    src.mkdir(parents=True)
+    # the directory already holds a user file, even one named like a shard
+    keep = src / "B-0001-p0.json"
+    keep.write_text('{"note": "值班员自己的文件，不能被生成清掉"}', encoding="utf-8")
     paths = replay.generate_demo(src)
     print(f"   {len(paths)} segment files generated in {src}")
     print(f"   batches: {sorted({p.name.split('-p')[0] for p in paths})}")
+    print(f"   user file kept: {keep.relative_to(src)} -> {keep.read_text()}")
+    replay.generate_demo(src)           # regenerate: flips to a fresh set
+    print(f"   regenerated; user file still intact: {keep.read_text()}")
 
     print()
     print("2. sync service receives them (out of order, with duplicates)")

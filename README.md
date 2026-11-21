@@ -15,9 +15,10 @@ app/
   tracing.py      沿水流方向做上游可达性追溯
   server.py       本地 HTTP 查询
   service.py      进程内编排（接收 → 发布 → 状态）
+  sample_store.py 样例集版本化：原子换版、保留用户文件、回放锁定单一版本、旧版本清理
   replay.py       离线回放源 + 示例数据生成
   __main__.py     命令行：sync / serve / status / trace
-tests/            47 个 unittest 用例（标准库，无需安装）
+tests/            60 个 unittest 用例（标准库，无需安装）
 examples/         demo.py、sample_batches/（示例日志）
 ```
 
@@ -25,9 +26,10 @@ examples/         demo.py、sample_batches/（示例日志）
 
 ```bash
 # 生成示例日志（已随仓库提供在 examples/sample_batches/，可重新生成）
+# 重生成不清空目录：用户已有文件（含与分片同名者）原样保留
 python3 -m app.replay --out examples/sample_batches
 
-# 接收并应用：把目录里的 *.json 片段逐个投递（可反复运行，重复投递无副作用）
+# 接收并应用：投递所选版本的分片（可反复运行，重复投递无副作用）
 python3 -m app sync  --db /tmp/drain.db --data /tmp/drain-data \
                      --from-source examples/sample_batches
 
@@ -170,13 +172,40 @@ X 或 X 上游的**在用**管段；已停用管段不参与（不计入结果�
 * 命令行：`python3 -m app.replay --out DIR`（只生成）或 `--deliver-to DB --data DIR`
   （生成并投递）。
 
+### 样例目录的换版与清理（`app/sample_store.py`）
+
+生成的样例集不再直接铺在目标目录里，而是放在其下的私有版本区：
+
+```
+<目标目录>/
+  user-notes.txt           用户文件：永不删除、永不覆盖
+  B-0001-p0.json           与分片同名的用户文件：同样保留
+  .samples/
+    manifest.json          {"format":1,"current":"<版本号>"}
+    versions/<版本号>/*.json  一套完整、不可变的样例
+    leases/<uuid>.json     正在回放该版本的读者租约
+```
+
+* **不清空用户文件**：生成只写 `.samples/` 内的临时目录，用户文件与目录永不 RMTREE。
+* **原子换版**：新样例先写进临时目录并 `fsync`，全部落盘后原子替换
+  `manifest.json`；写到一半被 `kill -9`，上一次的 `current` 仍完整可回放。
+* **一次回放只消费一套**：`deliver` / `sync --from-source` 在开始时就解析并锁定
+  当前版本；期间再换版不会让队列改道，别的版本的 JSON、用户 JSON 都不进入确认/发布。
+* **旧版本不增长**：换版成功后，既非当前、也无存活租约的旧版本即被清理；租约保证
+  在途回放的旧分片仍可读，死进程留下的旧租约会被回收。反复生成同一内容不会新增版本。
+* **裸目录照旧**：目录里没有 `.samples/manifest.json` 时沿用既有行为——投递目录内
+  全部 `*.json`，`--watch` 继续拾取新文件。
+
 ## 9. 测试
 
 ```bash
-python3 tests/run_all.py            # 47 个用例，约 10 秒
+python3 tests/run_all.py            # 60 个用例，约 10 秒
 python3 tests/run_all.py 2>/dev/null | tail -3
 ```
 
 覆盖面：乱序/重复/冲突片段、非法 JSON 与非法字段、`kill -9` 后恢复、发布中途失败回滚、
 超大批次（4 万接点+4 万管段、约 7 MB）在 96 MiB 数据段上限下接收并应用、应用期间并发查询、
-新旧编号等价、改向/停用的追溯语义、HTTP 状态码、离线回放与命令行全流程。
+新旧编号等价、改向/停用的追溯语义、HTTP 状态码、离线回放与命令行全流程；
+样例生成的三类场景（`tests/test_samples.py`）：生成中断（异常/`kill -9`）、
+多次换版（保留用户文件、单次回放只消费选中版本）、旧版本清理（租约保护在途回放、
+死租约回收、重复生成不增长）。

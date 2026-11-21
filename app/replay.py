@@ -11,6 +11,12 @@ Simulates the upstream engineering system that ships log segments:
 * it can be killed at any point and re-run: already-acknowledged segments are
   simply not re-sent, and re-sending is harmless anyway.
 
+Generated sets are *versioned* (see :mod:`app.sample_store`): regeneration
+never clears the target directory, keeps every pre-existing user file even
+when it shares a name with a shard, and installs the new set atomically.  A
+delivery run pins the version it selected, so JSON files belonging to another
+version -- or to the user -- never enter the confirm/publish path.
+
 A batch file looks like::
 
     {"batch": "B-0004", "seq": 4, "total": 6, "upgrade": true,
@@ -26,9 +32,10 @@ from __future__ import annotations
 import argparse
 import json
 import random
-import shutil
 import sys
 from pathlib import Path
+
+from . import sample_store
 
 SECTIONS = ("ids", "taps", "lays", "redirects", "retires")
 
@@ -132,40 +139,48 @@ def write_streamed_segment(path, header: dict, sections: dict) -> Path:
 
 def deliver(source_dir: Path, sync, *, order=None, duplicate_every=0,
             duplicate_seed=7, verbose=True) -> dict:
-    """Deliver every segment under ``source_dir`` through ``sync.accept``."""
-    paths = sorted(Path(source_dir).glob("*.json"))
-    if order is not None:
-        paths = order(paths)
-    else:
-        paths = _shuffle_like_source(paths, duplicate_seed)
+    """Deliver every segment of the selected sample set through ``sync``.
 
-    acked, dup, rejected = [], 0, []
-    rng = random.Random(duplicate_seed)
-    queue = list(paths)
-    while queue:
-        p = queue.pop(0)
-        try:
-            out = sync.accept(p)
-        except Exception as exc:  # noqa: BLE001
-            rejected.append((p.name, str(exc)))
+    ``source_dir`` may be a managed sample directory or a bare directory of
+    ``*.json`` segments.  When it is managed, exactly the version selected at
+    the start of the run is consumed: a generation that flips the pointer
+    mid-run neither truncates the queue nor feeds the new set's files (or any
+    unrelated JSON) into confirmation/publishing.
+    """
+    with sample_store.open_source(source_dir) as source:
+        paths = list(source.paths)
+        if order is not None:
+            paths = order(paths)
+        else:
+            paths = _shuffle_like_source(paths, duplicate_seed)
+
+        acked, dup, rejected = [], 0, []
+        rng = random.Random(duplicate_seed)
+        queue = list(paths)
+        while queue:
+            p = queue.pop(0)
+            try:
+                out = sync.accept(p)
+            except Exception as exc:  # noqa: BLE001
+                rejected.append((p.name, str(exc)))
+                if verbose:
+                    print(f"REJECTED  {p.name}: {exc}")
+                continue
+            if out["status"] == "duplicate":
+                dup += 1
+                if verbose:
+                    print(f"duplicate {p.name}: {out.get('reason', '')}")
+                continue
+            acked.append(out["segment"])
             if verbose:
-                print(f"REJECTED  {p.name}: {exc}")
-            continue
-        if out["status"] == "duplicate":
-            dup += 1
-            if verbose:
-                print(f"duplicate {p.name}: {out.get('reason', '')}")
-            continue
-        acked.append(out["segment"])
-        if verbose:
-            applied = ",".join(b["batch"]
-                               for b in (out.get("publish") or {}).get("applied", []))
-            print(f"accepted  {p.name} -> {out['segment']} "
-                  f"(batch {out['batch']} part {out['part']}/{out['parts']}"
-                  f"{', published ' + applied if applied else ''})")
-        if duplicate_every and rng.random() < 1.0 / duplicate_every:
-            queue.insert(min(len(queue), rng.randrange(0, len(queue) + 1)), p)
-    return {"accepted": acked, "duplicates": dup, "rejected": rejected}
+                applied = ",".join(b["batch"]
+                                   for b in (out.get("publish") or {}).get("applied", []))
+                print(f"accepted  {p.name} -> {out['segment']} "
+                      f"(batch {out['batch']} part {out['part']}/{out['parts']}"
+                      f"{', published ' + applied if applied else ''})")
+            if duplicate_every and rng.random() < 1.0 / duplicate_every:
+                queue.insert(min(len(queue), rng.randrange(0, len(queue) + 1)), p)
+        return {"accepted": acked, "duplicates": dup, "rejected": rejected}
 
 
 def _shuffle_like_source(paths, seed):
@@ -192,12 +207,19 @@ def generate_demo(root: Path) -> list[Path]:
     both notations, a batch that retires a joint (cascading to its pipes), and
     a final batch that the source has only half delivered -- so the demo ends
     with a published snapshot plus a visible "waiting for parts" blocker.
+
+    ``root`` is never cleared: generation writes into a private version and
+    flips the manifest to it atomically, so pre-existing user files (including
+    ones named like a segment) survive and a hard kill mid-write leaves the
+    previous version replayable.  Returns the shard paths of the new version.
     """
     root = Path(root)
-    if root.exists():
-        shutil.rmtree(root)
-    root.mkdir(parents=True)
+    root.mkdir(parents=True, exist_ok=True)
+    version = sample_store.publish_samples(root, _populate_demo)
+    return sample_store.SampleStore(root).segment_paths(version)
 
+
+def _populate_demo(staging: Path) -> None:
     batches = []
 
     # -- B-0001: the legacy network (global J- ids only) --------------------
@@ -311,16 +333,15 @@ def generate_demo(root: Path) -> list[Path]:
 
     paths = []
     for b in batches:
-        paths += write_segments(b, root)
+        paths += write_segments(b, staging)
     # the source holds back B-0006 part 1 in the demo
-    held = root / "B-0006-p1.json"
+    held = staging / "B-0006-p1.json"
     if held.exists():
         held.unlink()
-    (root / "HELD-BACK.txt").write_text(
+    (staging / "HELD-BACK.txt").write_text(
         "B-0006-p1.json is deliberately not delivered in this demo.\n"
         "The published snapshot stays at seq 5 while the source finishes the\n"
         "batch, and traces keep working.\n", encoding="utf-8")
-    return paths
 
 
 def main(argv=None):
