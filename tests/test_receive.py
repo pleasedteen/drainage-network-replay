@@ -137,13 +137,14 @@ class ReceivingTest(TempDirTest):
             svc.accept(p)
 
     def test_ack_survives_hard_kill_and_restart(self):
-        db, data = self.work / "drain.db", self.work / "data"
+        inbox, publish = self.inbox_db, self.publish_db
+        data = self.work / "data"
         segs = self.write_batch("B-0001", 1, 2, parts=2, items=basic_items(1, 6))
         script = textwrap.dedent(f"""
             import sys; sys.path.insert(0, {str(ROOT)!r})
             from app import service
-            svc = service.SyncService({str(db)!r}, {str(data)!r},
-                                      auto_publish=False)
+            svc = service.SyncService({str(inbox)!r}, {str(publish)!r},
+                                      {str(data)!r}, auto_publish=False)
             print(svc.accept({str(segs[0])!r})["status"], flush=True)
             import time; time.sleep(60)
         """)
@@ -156,7 +157,7 @@ class ReceivingTest(TempDirTest):
             os.kill(proc.pid, signal.SIGKILL)
             proc.wait()
 
-        svc = service.SyncService(db, data)
+        svc = service.SyncService(inbox, publish, data)
         self.assertEqual(svc.accept(segs[0])["status"], "duplicate")
         self.assertEqual(svc.status()["batches"][0]["parts_received"], [0])
         svc.accept(segs[1])
@@ -165,7 +166,8 @@ class ReceivingTest(TempDirTest):
         self.assertEqual(st["snapshot"]["joints"], 6)
 
     def test_crash_during_staging_leaves_no_partial_state(self):
-        db, data = self.work / "drain.db", self.work / "data"
+        inbox, publish = self.inbox_db, self.publish_db
+        data = self.work / "data"
         seg = self.write_batch("B-0001", 1, 1, items=basic_items(1, 2000))[0]
 
         orig = archive._stage
@@ -175,13 +177,13 @@ class ReceivingTest(TempDirTest):
 
         archive._stage = boom
         try:
-            svc = service.SyncService(db, data)
+            svc = service.SyncService(inbox, publish, data)
             with self.assertRaises(RuntimeError):
                 svc.accept(seg)
         finally:
             archive._stage = orig
 
-        conn = sqlite3.connect(db)
+        conn = sqlite3.connect(inbox)
         try:
             for table in ("segments", "st_taps", "st_lays", "batches"):
                 n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -189,7 +191,7 @@ class ReceivingTest(TempDirTest):
         finally:
             conn.close()
 
-        svc = service.SyncService(db, data)
+        svc = service.SyncService(inbox, publish, data)
         self.assertEqual(svc.accept(seg)["status"], "accepted")
         self.assertEqual(svc.status()["snapshot"]["joints"], 2000)
 

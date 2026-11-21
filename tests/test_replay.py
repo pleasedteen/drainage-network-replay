@@ -39,8 +39,8 @@ class ReplayTest(TempDirTest):
         pairs = [("J-001012", "C4:01012"), ("J-001015", "C5:01015"),
                  ("J-001099", "C5:00099"), ("J-001003", "C4:01003")]
         for old, new in pairs:
-            a = tracing.trace_upstream(svc.db_path, old)
-            b = tracing.trace_upstream(svc.db_path, new)
+            a = tracing.trace_upstream(svc.publish_db, old)
+            b = tracing.trace_upstream(svc.publish_db, new)
             self.assertEqual(a["totals"], b["totals"], (old, new))
             self.assertEqual(a["joints"], b["joints"], (old, new))
             self.assertEqual(a["basis"], b["basis"], (old, new))
@@ -62,23 +62,26 @@ class ReplayTest(TempDirTest):
     def test_cli_sync_then_trace(self):
         src = self.work / "source"
         replay.generate_demo(src)
-        db, data = self.work / "drain.db", self.work / "data"
+        inbox, publish = self.inbox_db, self.publish_db
+        data = self.work / "data"
         out = subprocess.run(
-            [sys.executable, "-m", "app", "sync", "--db", str(db),
-             "--data", str(data), "--from-source", str(src)],
+            [sys.executable, "-m", "app", "sync", "--inbox-db", str(inbox),
+             "--publish-db", str(publish), "--data", str(data),
+             "--from-source", str(src)],
             cwd=ROOT, capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("published", out.stdout)
         out = subprocess.run(
-            [sys.executable, "-m", "app", "trace", "--db", str(db),
-             "--ref", "C4:01012", "--format", "text"],
+            [sys.executable, "-m", "app", "trace", "--publish-db",
+             str(publish), "--ref", "C4:01012", "--format", "text"],
             cwd=ROOT, capture_output=True, text=True, timeout=60)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("上游追溯", out.stdout)
         self.assertIn("C4:01012", out.stdout)
         self.assertIn("B-0005", out.stdout)
         out = subprocess.run(
-            [sys.executable, "-m", "app", "status", "--db", str(db)],
+            [sys.executable, "-m", "app", "status", "--publish-db",
+             str(publish), "--inbox-db", str(inbox)],
             cwd=ROOT, capture_output=True, text=True, timeout=60)
         self.assertEqual(json.loads(out.stdout)["snapshot"]["published_batch"],
                          "B-0005")

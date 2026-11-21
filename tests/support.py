@@ -22,8 +22,17 @@ class TempDirTest(unittest.TestCase):
         self.work = Path(self._tmp.name)
         self.addCleanup(self._tmp.cleanup)
 
+    @property
+    def inbox_db(self):
+        return self.work / "inbox.db"
+
+    @property
+    def publish_db(self):
+        return self.work / "publish.db"
+
     def make_svc(self, *, auto_publish=True):
-        svc = service.SyncService(self.work / "drain.db", self.work / "data",
+        svc = service.SyncService(self.inbox_db, self.publish_db,
+                                  self.work / "data",
                                   auto_publish=auto_publish)
         self.addCleanup(lambda: None)
         return svc

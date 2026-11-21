@@ -56,7 +56,8 @@ class ScaleTest(TempDirTest):
         script = textwrap.dedent(f"""
             import sys; sys.path.insert(0, {str(ROOT)!r})
             from app import service
-            svc = service.SyncService({str(self.work / 'drain.db')!r},
+            svc = service.SyncService({str(self.inbox_db)!r},
+                                      {str(self.publish_db)!r},
                                       {str(self.work / 'data')!r})
             out = svc.accept({str(seg)!r})
             st = svc.status()
@@ -96,7 +97,7 @@ class ScaleTest(TempDirTest):
         def reader():
             while not stop.is_set():
                 try:
-                    res = tracing.trace_upstream(svc.db_path, "J-000002")
+                    res = tracing.trace_upstream(svc.publish_db, "J-000002")
                     results.append((res["snapshot"]["published_batch"],
                                     res["totals"]["upstream_pipes"]))
                 except Exception as exc:          # noqa: BLE001
@@ -115,7 +116,7 @@ class ScaleTest(TempDirTest):
                          {("B-0001", 1)})
         self.assertTrue(all(r[0] in ("B-0001", "B-0002") for r in results))
         self.assertEqual(out["publish"]["applied"][0]["batch"], "B-0002")
-        final = tracing.trace_upstream(svc.db_path, "J-000002")
+        final = tracing.trace_upstream(svc.publish_db, "J-000002")
         self.assertEqual(final["snapshot"]["published_batch"], "B-0002")
 
     def test_trace_result_limit_is_enforced(self):
@@ -127,10 +128,11 @@ class ScaleTest(TempDirTest):
         seg = self.write_batch("B-0001", 1, 1, items=items)
         self.deliver = None
         svc.accept(seg[0])
-        res = tracing.trace_upstream(svc.db_path, f"J-{n - 1:06d}", limit=500)
+        res = tracing.trace_upstream(svc.publish_db, f"J-{n - 1:06d}",
+                                     limit=500)
         self.assertEqual(res["totals"]["upstream_joints"], n)
         with self.assertRaises(tracing.LimitExceeded):
-            tracing.trace_upstream(svc.db_path, f"J-{n - 1:06d}", limit=50)
+            tracing.trace_upstream(svc.publish_db, f"J-{n - 1:06d}", limit=50)
 
 
 if __name__ == "__main__":

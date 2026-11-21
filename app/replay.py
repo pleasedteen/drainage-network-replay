@@ -327,20 +327,25 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="offline replay source")
     ap.add_argument("--out", default="examples/sample_batches",
                     help="directory to write generated segments into")
-    ap.add_argument("--deliver-to", default=None,
-                    help="if set: replay --out into this DB")
+    ap.add_argument("--deliver", action="store_true",
+                    help="deliver --out into the inbox/publish databases")
+    ap.add_argument("--inbox-db", default=None)
+    ap.add_argument("--publish-db", default=None)
     ap.add_argument("--data", default=None)
     ap.add_argument("--duplicate-every", type=int, default=0)
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
 
-    if args.deliver_to is None:
+    if not args.deliver:
         paths = generate_demo(Path(args.out))
         print(f"wrote {len(paths)} segment files to {args.out}")
         return 0
 
     from .service import SyncService
-    svc = SyncService(args.deliver_to, args.data or str(Path(args.deliver_to).parent / "data"))
+    inbox = args.inbox_db or str(Path(args.out).parent / "inbox.db")
+    publish = args.publish_db or str(Path(args.out).parent / "publish.db")
+    data = args.data or str(Path(args.out).parent / "data")
+    svc = SyncService(inbox, publish, data)
     stats = deliver(Path(args.out), svc, duplicate_every=args.duplicate_every,
                     verbose=not args.quiet)
     print(json.dumps({"accepted": len(stats["accepted"]),

@@ -1,12 +1,24 @@
-"""SQLite bootstrap: schema, connections, pragmas.
+"""SQLite bootstrap: schemas, connections, pragmas.
 
-A single database file holds both the append-only sync bookkeeping (landed
-segments, staging rows) and the published network.  That is deliberate: the
-acknowledgement of a segment and the staging rows derived from it commit in
-one transaction, so a ``kill -9`` can never leave the two out of step.
+Storage is split into two independent database files:
 
-Readers open the database read-only and WAL lets them keep serving the last
-published batch while a large batch is being applied.
+* the **inbox** (接收库) holds the append-only sync bookkeeping: landed
+  segments, per-batch receive progress and the ``st_*`` staging rows.  The
+  acknowledgement of a segment and the staging rows derived from it commit in
+  one transaction on this database, so a ``kill -9`` can never leave the two
+  out of step.
+* the **publish** database (发布库) holds the published network (joints,
+  pipes, reference mappings), the per-batch effect counts and the publish
+  ledger (``published_batches``).  Each batch is applied in one transaction
+  on this database, so readers only ever see the network as of the end of
+  some batch.
+
+Because the two sides live in different files, receiving keeps acknowledging
+segments while a large batch is being published, and queries keep answering
+from the publish database even when the inbox is stopped or unavailable.
+
+Readers open the publish database read-only and WAL lets them keep serving
+the last published batch while a large batch is being applied.
 """
 
 from __future__ import annotations
@@ -15,7 +27,10 @@ import os
 import sqlite3
 from pathlib import Path
 
-SCHEMA = """
+# ---------------------------------------------------------------------------
+# inbox (接收库): what arrived, acknowledged and staged
+# ---------------------------------------------------------------------------
+INBOX_SCHEMA = """
 CREATE TABLE IF NOT EXISTS batches (
     batch_id       TEXT NOT NULL,
     seq            INTEGER NOT NULL,   -- position in the source's batch order
@@ -75,8 +90,12 @@ CREATE TABLE IF NOT EXISTS st_retires (
     kind TEXT NOT NULL, ref TEXT NOT NULL,
     PRIMARY KEY (batch_id, part, item)
 ) WITHOUT ROWID;
+"""
 
--- published network
+# ---------------------------------------------------------------------------
+# publish (发布库): the queryable network plus the publish ledger
+# ---------------------------------------------------------------------------
+PUBLISH_SCHEMA = """
 CREATE TABLE IF NOT EXISTS joints (
     uid         INTEGER PRIMARY KEY AUTOINCREMENT,
     zone        TEXT NOT NULL,            -- '' while the city still uses global ids
@@ -115,12 +134,12 @@ CREATE TABLE IF NOT EXISTS joint_refs (
 CREATE INDEX IF NOT EXISTS joint_refs_kind_uid ON joint_refs(kind, uid);
 CREATE INDEX IF NOT EXISTS joint_refs_uid ON joint_refs(uid);
 
--- what each applied batch actually did; this is what a trace cites as basis.
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 ) WITHOUT ROWID;
 
+-- what each applied batch actually did; this is what a trace cites as basis.
 CREATE TABLE IF NOT EXISTS batch_effects (
     batch_id TEXT NOT NULL,
     seq      INTEGER NOT NULL,
@@ -130,6 +149,18 @@ CREATE TABLE IF NOT EXISTS batch_effects (
     n        INTEGER NOT NULL,
     PRIMARY KEY (batch_id, kind)
 ) WITHOUT ROWID;
+
+-- the publish ledger: which batches the queryable network already reflects.
+-- Written in the same transaction as the batch's network changes, so the
+-- ledger and the snapshot can never disagree; seq is unique, which makes a
+-- double apply of one seq impossible at the storage level.
+CREATE TABLE IF NOT EXISTS published_batches (
+    batch_id  TEXT PRIMARY KEY,
+    seq       INTEGER NOT NULL UNIQUE,
+    state     TEXT NOT NULL,              -- applied | rejected
+    error     TEXT,
+    applied_at TEXT
+);
 """
 
 
@@ -157,7 +188,15 @@ def connect(path: str | os.PathLike, *, read_only: bool = False,
     return conn
 
 
-def init_db(path: str | os.PathLike) -> sqlite3.Connection:
+def init_inbox(path: str | os.PathLike) -> sqlite3.Connection:
+    """Create (if needed) the receiving database: segments, staging, batches."""
     conn = connect(path)
-    conn.executescript(SCHEMA)
+    conn.executescript(INBOX_SCHEMA)
+    return conn
+
+
+def init_publish(path: str | os.PathLike) -> sqlite3.Connection:
+    """Create (if needed) the publishing database: network + publish ledger."""
+    conn = connect(path)
+    conn.executescript(PUBLISH_SCHEMA)
     return conn

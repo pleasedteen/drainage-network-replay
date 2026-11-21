@@ -17,7 +17,7 @@ class TraceTest(TempDirTest):
                 svc.accept(p)
 
     def trace(self, svc, ref, **kw):
-        return tracing.trace_upstream(svc.db_path, ref, **kw)
+        return tracing.trace_upstream(svc.publish_db, ref, **kw)
 
     def codes(self, res):
         return {p["code"] for p in res["pipes"]}
@@ -234,13 +234,13 @@ class RezoningTest(TempDirTest):
         for group in (b1, b2, b3):
             for p in group:
                 svc.accept(p)
-        res = tracing.trace_upstream(svc.db_path, "Q6:00888")
+        res = tracing.trace_upstream(svc.publish_db, "Q6:00888")
         self.assertEqual({p["code"] for p in res["pipes"]}, {"P-000001"})
         self.assertEqual(res["query"]["resolved"]["legacy_id"], "J-000002")
         # the stale zoned spelling no longer answers
         with self.assertRaises(tracing.NotFound):
-            tracing.trace_upstream(svc.db_path, "Q4:00002")
+            tracing.trace_upstream(svc.publish_db, "Q4:00002")
         # the legacy spelling still does
-        again = tracing.trace_upstream(svc.db_path, "J-000002")
+        again = tracing.trace_upstream(svc.publish_db, "J-000002")
         self.assertEqual(again["query"]["resolved"]["uid"],
                          res["query"]["resolved"]["uid"])

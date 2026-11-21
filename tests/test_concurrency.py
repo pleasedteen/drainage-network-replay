@@ -21,7 +21,8 @@ class ConcurrencyTest(TempDirTest):
         barrier = threading.Barrier(8)
 
         def send():
-            s = service.SyncService(self.work / "drain.db", self.work / "data")
+            s = service.SyncService(self.inbox_db, self.publish_db,
+                                    self.work / "data")
             barrier.wait()
             try:
                 results.append(s.accept(segs[0]))
@@ -50,7 +51,8 @@ class ConcurrencyTest(TempDirTest):
         barrier = threading.Barrier(len(segs))
 
         def send(p):
-            s = service.SyncService(self.work / "drain.db", self.work / "data")
+            s = service.SyncService(self.inbox_db, self.publish_db,
+                                self.work / "data")
             barrier.wait()
             try:
                 s.accept(p)
@@ -67,7 +69,7 @@ class ConcurrencyTest(TempDirTest):
         self.assertEqual(st["snapshot"]["published_batch"], "B-0001")
         self.assertEqual(st["snapshot"]["joints"], 60)
         self.assertEqual(st["publish_blocker"]["reason"], "up_to_date")
-        res = tracing.trace_upstream(svc.db_path, "J-000060")
+        res = tracing.trace_upstream(svc.publish_db, "J-000060")
         self.assertEqual(res["totals"]["upstream_pipes"], 59)
 
 

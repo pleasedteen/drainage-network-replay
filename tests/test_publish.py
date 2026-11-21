@@ -20,8 +20,8 @@ class PublishTest(TempDirTest):
         barrier = threading.Barrier(4)
 
         def run():
-            s = service.SyncService(self.work / "drain.db", self.work / "data",
-                                    auto_publish=False)
+            s = service.SyncService(self.inbox_db, self.publish_db,
+                                    self.work / "data", auto_publish=False)
             barrier.wait()
             try:
                 reports.append(s.publish())
@@ -48,10 +48,10 @@ class PublishTest(TempDirTest):
             svc.accept(p)
         self.assertIsNone(svc.status()["snapshot"]["published_batch"])
 
-        restarted = service.SyncService(self.work / "drain.db",
+        restarted = service.SyncService(self.inbox_db, self.publish_db,
                                         self.work / "data")
         self.assertEqual(restarted.publish()["applied"][0]["batch"], "B-0001")
-        res = tracing.trace_upstream(restarted.db_path, "J-000002")
+        res = tracing.trace_upstream(restarted.publish_db, "J-000002")
         self.assertEqual(res["totals"]["upstream_pipes"], 1)
 
     def test_queries_never_see_a_half_applied_batch(self):
@@ -61,7 +61,7 @@ class PublishTest(TempDirTest):
             "taps": taps("J-000001", "J-000002"), "lays": chain(1, 2)})
         for p in ok:
             svc.accept(p)
-        before = tracing.trace_upstream(svc.db_path, "J-000002")
+        before = tracing.trace_upstream(svc.publish_db, "J-000002")
 
         # second batch adds a joint then hits a bad pipe reference
         bad = self.write_batch("B-0002", 2, 2, items={
@@ -69,7 +69,7 @@ class PublishTest(TempDirTest):
             "lays": [{"code": "P-000100", "from": "J-000003",
                       "to": "J-000404"}]})
         svc.accept(bad[0])
-        after = tracing.trace_upstream(svc.db_path, "J-000002")
+        after = tracing.trace_upstream(svc.publish_db, "J-000002")
         self.assertEqual(before["totals"], after["totals"])
         self.assertEqual(before["snapshot"], after["snapshot"])
         self.assertEqual(svc.status()["snapshot"]["published_batch"], "B-0001")

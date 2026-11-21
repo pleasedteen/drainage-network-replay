@@ -2,54 +2,82 @@
 
 值班员接到积水报告后，用本服务回答：**哪些接点、哪些管段会把水引到事发接点，依据的是哪些工程改接批次。**
 
-实现语言 Python 3.11，存储 SQLite，查询接口为本地 HTTP。无第三方依赖。
+实现语言 Python 3.11，存储 SQLite（**接收库 / 发布库两个独立文件**），查询接口为本地 HTTP。无第三方依赖。
 
 ```
 app/
   jsonstream.py   大日志片段的分块 JSON 读取（单条占位内存，不整体载入）
   ids.py          接点/管段编号语法（旧号 J-000123、片区号 Q4:00123）
   wire.py         日志片段格式校验（整段校验通过才可能被确认）
-  db.py           SQLite 结构与连接（WAL；读连接 mode=ro）
-  archive.py      接收：校验 → 落盘（内容寻址）→ 写入暂存表，与"确认"同一次提交
-  snapshot.py     按批次顺序把完整批次应用到已发布管网（单事务、可回滚）
-  tracing.py      沿水流方向做上游可达性追溯
-  server.py       本地 HTTP 查询
+  db.py           两套 SQLite 结构与连接（WAL；读连接 mode=ro）
+  archive.py      接收：校验 → 落盘（内容寻址）→ 写入接收库暂存表，与"确认"同一次提交
+  snapshot.py     按批次顺序把完整批次从接收库应用到发布库（单事务、可回滚、崩溃后对账）
+  migrate.py      旧单库 → 接收库+发布库 的迁移与逐域校验（快照/编号映射/拓扑/批次依据）
+  tracing.py      沿水流方向做上游可达性追溯（只读发布库）
+  server.py       本地 HTTP 查询（只依赖发布库；接收库停了查询照常）
   service.py      进程内编排（接收 → 发布 → 状态）
   replay.py       离线回放源 + 示例数据生成
-  __main__.py     命令行：sync / serve / status / trace
-tests/            47 个 unittest 用例（标准库，无需安装）
-examples/         demo.py、sample_batches/（示例日志）
+  __main__.py     命令行：sync / serve / status / trace / migrate
+tests/            54 个 unittest 用例（标准库，无需安装）
+examples/         demo.py、splitcheck.py（离线验收）、sample_batches/（示例日志）
 ```
 
-## 1. 启动
+## 1. 两个独立的数据库
+
+* **接收库 inbox**（改接日志接收）：片段落盘记录、暂存表、批次接收进度。
+  确认 = 落盘文件 + 暂存行 + 片段记录在接收库的同一次事务里提交。
+* **发布库 publish**（管网发布）：已发布管网（接点、管段、编号映射）、批次效果、
+  发布台账 `published_batches`。每个批次在发布库的一个事务里生效。
+
+由此得到三件事：**接收库一停，HTTP 查接点编号、上游、依据批次照常**（它们只读发布库）；
+**发布大批次期间，后续片段照常拿到确认**（接收不写发布库，不被长事务堵住）；
+**小批次的写入量只随改动规模增长**（发布库按批次增量改写，不整网重写）。
+
+## 2. 启动
 
 ```bash
 # 生成示例日志（已随仓库提供在 examples/sample_batches/，可重新生成）
 python3 -m app.replay --out examples/sample_batches
 
 # 接收并应用：把目录里的 *.json 片段逐个投递（可反复运行，重复投递无副作用）
-python3 -m app sync  --db /tmp/drain.db --data /tmp/drain-data \
-                     --from-source examples/sample_batches
+python3 -m app sync  --inbox-db /tmp/drain-inbox.db --publish-db /tmp/drain-publish.db \
+                     --data /tmp/drain-data --from-source examples/sample_batches
 
-# 起本地查询服务
-python3 -m app serve --db /tmp/drain.db --data /tmp/drain-data --port 8787
+# 起本地查询服务（--inbox-db 可选：只影响 /v1/batches 的接收进度展示）
+python3 -m app serve --publish-db /tmp/drain-publish.db \
+                     --inbox-db /tmp/drain-inbox.db --port 8787
 
 # 命令行直接查询（不必起 HTTP 服务）
-python3 -m app trace --db /tmp/drain.db --ref Q4:01012 --format text
-python3 -m app status --db /tmp/drain.db
+python3 -m app trace --publish-db /tmp/drain-publish.db --ref Q4:01012 --format text
+python3 -m app status --publish-db /tmp/drain-publish.db --inbox-db /tmp/drain-inbox.db
 ```
 
-## 2. 一条测试命令（80 秒内输出可读结果）
+### 从旧的单库迁移
 
 ```bash
-timeout 80 python3 examples/demo.py
+python3 -m app migrate --db /tmp/drain.db \
+       --inbox-db /tmp/drain-inbox.db --publish-db /tmp/drain-publish.db
 ```
 
-它会：生成示例源 → 乱序+重复投递 → 打印发布状态 → 起 HTTP 服务 →
-用**旧号**和**片区号**各查一次同一接点（结果一致）→ 打印值班员可读的上游追溯清单
-（含"依据批次"）。全程约 3 秒。完整测试套件：`python3 tests/run_all.py`（约 10 秒）。
+迁移只读旧库、写入两个新库，并逐项校验：**快照、编号映射、拓扑、批次依据**必须与旧库
+一致；**已收齐未发布**的批次从暂存续跑发布，**已确认但仍缺片**的批次保留已收分片、
+只等缺片到齐。目标文件已存在时拒绝覆盖（`--force` 强制）。
 
-## 3. 日志片段格式
+## 3. 一条测试命令（80 秒内输出可读结果）
+
+```bash
+timeout 80 python3 examples/splitcheck.py
+```
+
+本地夹具、全程离线，覆盖：**旧库迁移**（四处一致 + 断点续跑）、**发布期间确认片段**
+（大批次发布 1.2s 期间新片段毫秒级拿到可恢复确认；改一处属性的小批写入几十 KiB，
+不随全网体量放大）、**强停恢复**（`kill -9` 后确认不丢、状态与可查询版本一致、
+效果只生效一次）、**接收库停止时 HTTP 查询不断线**。全程约 12 秒。
+
+另有一条端到端演示：`timeout 80 python3 examples/demo.py`（约 3 秒）。
+完整测试套件：`python3 tests/run_all.py`（约 25 秒）。
+
+## 4. 日志片段格式
 
 一个片段是一个 JSON 对象；其数组字段可达千万级，服务按元素流式处理，
 **单批日志可以远大于同步进程可用内存**。
@@ -90,10 +118,11 @@ timeout 80 python3 examples/demo.py
 （避免"改了但没生效"的静默错误）。管段号以 `P-` 开头，接点号以 `J-`/片区号带冒号，
 两者不会混淆。
 
-## 4. 接收、确认与崩溃恢复
+## 5. 接收、确认与崩溃恢复
 
-* 每个片段独立确认。确认 = 该片段的**落盘文件 + 暂存行 + 片段记录**在同一次 SQLite
-  事务里提交；提交之后源端即可清理副本。
+* 每个片段独立确认。确认 = 该片段的**落盘文件 + 暂存行 + 片段记录**在**接收库**同一次
+  事务里提交；提交之后源端即可清理副本。确认不依赖发布库：发布暂停、崩溃或正在
+  应用大批次，确认都照常成立（即可恢复的确认）。
 * 进程在提交后立刻被 `kill -9`：重启后该片段仍是"已确认"，不会要求重传
   （`tests/test_receive.py::test_ack_survives_hard_kill_and_restart`）。
 * 进程在提交前被杀死：事务回滚，暂存表和片段记录都不存在，源端重传即可
@@ -103,21 +132,30 @@ timeout 80 python3 examples/demo.py
 * 片段可乱序到达；同一批次可以等多片到齐才发布。并发投递安全
   （`test_concurrency.py`）。
 
-## 5. 按批次生效
+## 6. 按批次生效（两库一个提交点）
 
 * 只有"下一顺位"的批次完整（`parts` 全部到齐，`total` 给出源端批次数）才会被应用。
-* 应用在**一个写事务**内完成；读连接永远看不到半个批次。
-* 应用失败（数据与已有管网矛盾，例如管段指向不存在的接点）→ 回滚并标记
+* 应用 = 从接收库读暂存行，在**发布库的一个写事务**里改网；该事务同时写入
+  `published_batches` 台账与 `applied_seq`，所以**台账永远和可查询的管网一致**，
+  读连接永远看不到半个批次。随后才用第二个小事务把接收库的批次行标记为
+  `applied`。
+* 在两个事务之间被 `kill -9`：发布库已提交、接收库还停在 `staging`。重启时
+  `reconcile` 以发布库为准对齐接收库；由于应用以 `seq == applied_seq + 1` 和台账的
+  `UNIQUE(seq)` 为门槛，**已提交的改接效果只生效一次**
+  （`tests/test_split.py::ReconcileTest`、`HardKillRecoveryTest`）。
+* 应用失败（数据与已有管网矛盾，例如管段指向不存在的接点）→ 回滚并在两库标记
   `rejected`，保留错误原因；**上一次完整发布的管网继续可查**，后续批次被阻塞直到
   人工处理（`status` 会给出 blocker）。
 * 有未完成批次时，查询照常返回最近一次完整发布的结果，响应里标明
   `snapshot.published_batch`（`test_queries_stay_available_while_a_big_batch_is_applied`）。
+* 发布是**增量**的：只改一处接点属性的小批，新增发布数据与写入页数随改动规模增长，
+  不随全网体量放大（`tests/test_split.py::WriteVolumeTest`）。
 
-## 6. 新老编号并存
+## 7. 新老编号并存
 
 * 接点内部用稳定 `uid`；管段只引用 `uid`，所以**既有管段无需改写**，升级后仍按实际
   连接参与追溯。
-* `ids` 表把旧号与片区号都挂到同一 `uid`（`joint_refs` 表，`ref` 唯一），
+* `joint_refs` 表把旧号与片区号都挂到同一 `uid`（`ref` 唯一），
   因此 `J-001012` 与 `Q4:01012` 解析到同一接点，查询结果完全相同
   （`test_trace.py::test_legacy_and_zoned_spellings_resolve_to_one_joint`）。
 * 升级批次之后仍可用旧号写入新的改接（`test_new_pipes_may_be_written_with_old_ids`）。
@@ -125,7 +163,7 @@ timeout 80 python3 examples/demo.py
 接点整体迁到另一片区时 `uid` 与既有管段不变，旧片区号失效、旧号继续可用
 （`test_joint_moved_to_another_zone_keeps_its_uid_and_pipes`）。
 
-## 7. 查询接口
+## 8. 查询接口
 
 ```
 GET /health
@@ -135,6 +173,10 @@ GET /v1/batches/<batch_id>            单批次：片段清单 + 该批次实际
 GET /v1/joint?ref=J-001012            解析一个编号（返回 uid、旧号、片区号、别名）
 GET /v1/trace/upstream?ref=Q4:01012[&format=text][&limit=50000][&include_retired=1]
 ```
+
+`/v1/snapshot`、`/v1/joint`、`/v1/trace/upstream` 只读**发布库**；`/v1/batches*`
+在接收库可用时并入接收进度，接收库停止时降级为发布台账视图（响应里
+`inbox: "unavailable"`），不报错。
 
 追溯结果（JSON）：
 
@@ -159,7 +201,7 @@ X 或 X 上游的**在用**管段；已停用管段不参与（不计入结果�
 数量），改向过的管段只按当前端点参与——即"按实际连接"。
 错误码：缺 `ref` → 400；编号无法解析/未知 → 404；结果超过 `limit` → 413。
 
-## 8. 离线回放源
+## 9. 离线回放源
 
 `app/replay.py` 模拟源端日志系统：
 
@@ -167,16 +209,18 @@ X 或 X 上游的**在用**管段；已停用管段不参与（不计入结果�
   停用批次、以及源端只交付了一半的最后一批）；
 * `deliver(source_dir, sync_service)`：可指定投递顺序、按概率重复投递，模拟乱序/重复；
 * `write_streamed_segment(...)`：逐条写超大批次，供容量测试使用；
-* 命令行：`python3 -m app.replay --out DIR`（只生成）或 `--deliver-to DB --data DIR`
-  （生成并投递）。
+* 命令行：`python3 -m app.replay --out DIR`（只生成）或
+  `--deliver --inbox-db I --publish-db P --data DIR`（生成并投递）。
 
-## 9. 测试
+## 10. 测试
 
 ```bash
-python3 tests/run_all.py            # 47 个用例，约 10 秒
+python3 tests/run_all.py            # 54 个用例，约 25 秒
 python3 tests/run_all.py 2>/dev/null | tail -3
 ```
 
 覆盖面：乱序/重复/冲突片段、非法 JSON 与非法字段、`kill -9` 后恢复、发布中途失败回滚、
 超大批次（4 万接点+4 万管段、约 7 MB）在 96 MiB 数据段上限下接收并应用、应用期间并发查询、
-新旧编号等价、改向/停用的追溯语义、HTTP 状态码、离线回放与命令行全流程。
+新旧编号等价、改向/停用的追溯语义、HTTP 状态码、离线回放与命令行全流程，
+以及拆分专项：旧库迁移四处一致与断点续跑、发布期间确认片段、写入量随改动规模、
+接收库停止时查询不断线、发布中 `kill -9` 后效果只生效一次。

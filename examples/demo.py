@@ -1,5 +1,6 @@
 """End-to-end walk-through: replay the sample source, query by HTTP, show the
-answer and the publish state.
+answer and the publish state -- and prove that queries keep answering when
+the inbox database is stopped.
 
 Run:  python3 examples/demo.py
 Everything it creates goes to a temporary directory that it prints.
@@ -41,7 +42,9 @@ def main():
 
     print()
     print("2. sync service receives them (out of order, with duplicates)")
-    svc = service.SyncService(work / "drain.db", work / "data")
+    print("   receiving -> inbox db, publishing -> publish db (two files)")
+    svc = service.SyncService(work / "inbox.db", work / "publish.db",
+                              work / "data")
     order = lambda ps: list(reversed(sorted(ps)))
     stats = replay.deliver(src, svc, order=order, duplicate_every=3,
                            duplicate_seed=11)
@@ -55,12 +58,13 @@ def main():
     print(f"   blocker            : {st['publish_blocker']}")
     for b in st["batches"]:
         print(f"   {b['batch']:8s} seq={b['seq']} state={b['state']:8s} "
-              f"parts={b['parts_received']}/{b['parts_expected']}"
+              f"parts={b.get('parts_received')}/{b.get('parts_expected')}"
               f"{'  error=' + b['error'] if b['error'] else ''}")
 
     print()
     print("4. query over HTTP (both spellings of the same joint)")
-    srv = make_server(work / "drain.db", work / "data", port=0)
+    srv = make_server(work / "publish.db", inbox_db=work / "inbox.db",
+                      data_dir=work / "data", port=0)
     import threading
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     port = srv.server_address[1]
@@ -73,7 +77,31 @@ def main():
               f"{[b['batch'] for b in data['basis']['referenced_batches']]}")
 
     print()
-    print("5. human-readable answer for the duty officer")
+    print("5. the inbox stops (接收库停止): queries keep answering")
+    stopped = work / "inbox.db.stopped"
+    (work / "inbox.db").rename(stopped)     # simulate an inbox outage
+    for suffix in ("-wal", "-shm"):
+        side = work / f"inbox.db{suffix}"
+        if side.exists():
+            side.rename(work / f"inbox.db.stopped{suffix}")
+    body = get(port, "/v1/trace/upstream?ref=C4:01012")
+    data = json.loads(body)
+    print(f"   trace still answers: {data['totals']}")
+    body = get(port, "/v1/joint?ref=J-001012")
+    print(f"   joint lookup still answers: uid={json.loads(body)['uid']}")
+    body = json.loads(get(port, "/v1/batches"))
+    print(f"   /v1/batches degrades: inbox={body['inbox']} "
+          f"blocker={body['publish_blocker']['reason']} "
+          f"(publish-side batch states still listed: "
+          f"{[b['batch'] for b in body['batches']]})")
+    stopped.rename(work / "inbox.db")       # inbox is back
+    for suffix in ("-wal", "-shm"):
+        side = work / f"inbox.db.stopped{suffix}"
+        if side.exists():
+            side.rename(work / f"inbox.db{suffix}")
+
+    print()
+    print("6. human-readable answer for the duty officer")
     print(get(port, "/v1/trace/upstream?ref=C4:01012&format=text"))
     srv.shutdown()
 

@@ -4,12 +4,15 @@ A segment that passes validation is
 
 1. stored byte-for-byte under ``<data>/segments/`` (content-addressed, so a
    repeated delivery of the identical bytes costs one hash), and
-2. replayed a second time into the ``st_*`` staging tables, inside the *same*
-   transaction that records the segment row.
+2. replayed a second time into the ``st_*`` staging tables of the **inbox
+   database**, inside the *same* transaction that records the segment row.
 
 Only after that transaction commits does the receiver answer ``accepted`` --
 i.e. the source may drop its copy.  A crash before the commit rolls back both
-the staging rows and the segment record, so redelivery is always safe.
+the staging rows and the segment record, so redelivery is always safe.  The
+acknowledgement is durable: it survives a ``kill -9`` and any later restart,
+because it lives in the inbox database alone -- publishing (a separate
+database) may be paused, crashed or still running, the ack stands either way.
 
 A large segment is never held in memory: it is streamed item by item into
 SQLite staging rows from the on-disk copy.  Both passes read the file from
@@ -211,10 +214,10 @@ def _parts_expected(conn, header: wire.Header) -> int:
 
 def land_segment(db_path, data_dir, source_path, *, chunk_size: int = 65536,
                  copy: bool = True) -> LandResult:
-    """Validate, land and stage one segment.  Idempotent.
+    """Validate, land and stage one segment into the inbox database.
 
-    Raises ``wire.SegmentError`` or ``LandError`` for anything that must not
-    be acknowledged.
+    Idempotent.  Raises ``wire.SegmentError`` or ``LandError`` for anything
+    that must not be acknowledged.
     """
     src = Path(source_path)
     data = Path(data_dir)

@@ -1,8 +1,13 @@
 """Local HTTP query API (standard library only).
 
-Read-only: opens the database with ``mode=ro`` per request.  Because batches
-are published transactionally, a request either sees the network as of batch
-N or as of batch N+1, never something in between.
+Read-only: opens the publish database with ``mode=ro`` per request.  Because
+batches are published transactionally, a request either sees the network as
+of batch N or as of batch N+1, never something in between.
+
+The joint / trace / snapshot endpoints read **only the publish database**, so
+they keep answering while the inbox (接收库) is stopped or absent.  The batch
+progress endpoints merge inbox receive progress when the inbox is available
+and degrade to the publish ledger when it is not.
 
 Endpoints
 ---------
@@ -35,11 +40,12 @@ class ApiError(Exception):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "DrainTrace/1.0"
+    server_version = "DrainTrace/2.0"
     protocol_version = "HTTP/1.1"
 
     # wiring set by make_server
-    db_path: str = ""
+    publish_db: str = ""
+    inbox_db: str | None = None
 
     def log_message(self, fmt, *args):  # quieter than the default
         if not getattr(self.server, "quiet", True):
@@ -74,28 +80,26 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/health":
                 return self._send(200, {"ok": True})
             if path == "/v1/snapshot":
-                conn = _ro(self.db_path)
+                conn = _ro(self.publish_db)
                 try:
                     return self._send(200, tracing.snapshot_info(conn))
                 finally:
                     conn.close()
             if path == "/v1/batches":
-                svc = service.SyncService(self.db_path, self._data_dir(),
-                                          auto_publish=False)
-                return self._send(200, svc.status())
+                return self._send(200, service.status_report(
+                    self.publish_db, self._inbox()))
             if path.startswith("/v1/batches/"):
                 bid = unquote(path[len("/v1/batches/"):])
-                svc = service.SyncService(self.db_path, self._data_dir(),
-                                          auto_publish=False)
                 try:
-                    return self._send(200, svc.batch_detail(bid))
+                    return self._send(200, service.batch_detail_report(
+                        self.publish_db, bid, self._inbox()))
                 except KeyError:
                     raise ApiError(404, f"unknown batch {bid!r}")
             if path == "/v1/joint":
                 ref = self._one(qs, "ref")
                 if not ref:
                     raise ApiError(400, "missing ?ref=")
-                conn = _ro(self.db_path)
+                conn = _ro(self.publish_db)
                 try:
                     return self._send(200, tracing.resolve_ref(conn, ref))
                 finally:
@@ -125,15 +129,15 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "limit must be an integer")
         include_retired = self._one(qs, "include_retired", "0") not in (
             "0", "false", "no", "")
-        result = tracing.trace_upstream(self.db_path, ref, limit=limit,
+        result = tracing.trace_upstream(self.publish_db, ref, limit=limit,
                                         include_retired=include_retired)
         if self._one(qs, "format") == "text":
             return self._send(200, render_text(result),
                               ctype="text/plain")
         return self._send(200, result)
 
-    def _data_dir(self):
-        return getattr(self.server, "data_dir", "")
+    def _inbox(self):
+        return self.inbox_db or getattr(self.server, "inbox_db", None)
 
 
 def _ro(db_path):
@@ -174,9 +178,16 @@ def render_text(result: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def make_server(db_path, data_dir="", host="127.0.0.1", port=0,
-                quiet=True) -> ThreadingHTTPServer:
-    handler = type("BoundHandler", (Handler,), {"db_path": str(db_path)})
+def make_server(publish_db, *, inbox_db=None, data_dir="", host="127.0.0.1",
+                port=0, quiet=True) -> ThreadingHTTPServer:
+    """Serve the query API.
+
+    ``publish_db`` alone answers every joint/trace/snapshot query;
+    ``inbox_db`` (optional) only adds receive progress to ``/v1/batches*``.
+    """
+    handler = type("BoundHandler", (Handler,),
+                   {"publish_db": str(publish_db),
+                    "inbox_db": str(inbox_db) if inbox_db else None})
     srv = ThreadingHTTPServer((host, port), handler)
     srv.data_dir = str(data_dir)
     srv.quiet = quiet

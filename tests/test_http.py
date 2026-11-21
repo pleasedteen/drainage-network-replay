@@ -20,7 +20,8 @@ class HttpTest(TempDirTest):
         self.svc.accept(self.write_batch("B-0001", 1, 1, items={
             "taps": taps(*[f"J-{i:06d}" for i in range(1, 5)]),
             "lays": chain(1, 4)})[0])
-        self.srv = make_server(self.svc.db_path, self.work / "data", port=0)
+        self.srv = make_server(self.svc.publish_db, inbox_db=self.svc.inbox_db,
+                               data_dir=self.work / "data", port=0)
         self.port = self.srv.server_address[1]
         self.thread = threading.Thread(target=self.srv.serve_forever,
                                        daemon=True)
