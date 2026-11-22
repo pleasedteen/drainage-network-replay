@@ -7,6 +7,18 @@ data conflicts with the published network is rolled back *and retired*: it
 keeps its ``rejected`` state plus an error, blocks later batches, and the last
 good snapshot stays queryable.
 
+Where the items come from
+-------------------------
+A confirmed segment keeps only its landed archive bytes, so applying a batch
+replays those bytes straight from disk: for each section, each part's arrays
+are read once, in ``(part, item)`` order, one item at a time -- no per-item
+intermediate copy is built and the archive bytes read stay within the size of
+the batch's own archives.  Segments confirmed by an older receiver may still
+have their items in the legacy ``st_*`` staging tables; those parts are read
+from staging instead, in the same order, so an old database's segments and
+newly landed ones apply side by side in the batch they belong to.  A batch's
+staging rows are dropped once the batch is applied.
+
 Identity model
 --------------
 A joint has a stable internal ``uid`` for its whole life, a current
@@ -19,14 +31,21 @@ the upgrade batch, both old and new spellings address the same joint.
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
+from pathlib import Path
 
+from . import jsonstream, wire
 from .ids import parse_ref
 
 
 class ApplyError(ValueError):
     """Data inside an otherwise complete batch contradicts the snapshot."""
+
+
+class ReplayError(RuntimeError):
+    """A confirmed segment's archive cannot be replayed (missing, truncated
+    or changed on disk).  Not an ``ApplyError``: the batch stays staged so
+    publishing can be retried once the archive is restored."""
 
 
 def _now() -> str:
@@ -166,23 +185,97 @@ def resolve_existing(conn, ref: str, what: str, seq: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# batch application
+# batch item source
 # ---------------------------------------------------------------------------
 
-def _rows(conn, table, batch_id):
-    """Stream staged items of one section in a stable order."""
-    order = {"st_ids": "part, item", "st_taps": "part, item"}
-    return conn.execute(f"SELECT * FROM {table} WHERE batch_id=? "
-                        f"ORDER BY {order.get(table, 'part, item')}", (batch_id,))
+def _archive_path(data_dir, stored: str) -> Path:
+    p = Path(stored)
+    return p if p.is_absolute() else Path(data_dir) / p
+
+
+# project a legacy staging row to the same tuple wire.validate_item returns
+_STAGED_PROJECT = {
+    "ids": lambda r: (r["old_ref"], r["new_ref"]),
+    "taps": lambda r: (r["ref"], r["zone"], r["local"], r["attrs"]),
+    "lays": lambda r: (r["code"], r["from_ref"], r["to_ref"], r["attrs"]),
+    "redirects": lambda r: (r["kind"], r["code"], r["from_ref"], r["to_ref"]),
+    "retires": lambda r: (r["kind"], r["ref"]),
+}
+
+
+class _Items:
+    """Stream one batch's items, section by section, in ``(part, item)``
+    order -- exactly the order the source sent them in.
+
+    Parts confirmed by the current receiver keep only their archive bytes and
+    are replayed from disk; parts an older receiver confirmed still have
+    staging rows and are read from there.  Both kinds mix freely within a
+    batch.
+    """
+
+    def __init__(self, conn, data_dir, batch_id):
+        self.conn = conn
+        self.data_dir = data_dir
+        self.batch_id = batch_id
+        self.parts = conn.execute(
+            "SELECT seg_id, part, path, ingested FROM segments "
+            "WHERE batch_id=? ORDER BY part", (batch_id,)).fetchall()
+
+    def section(self, name: str):
+        for seg in self.parts:
+            origin = seg["ingested"]
+            if origin == "validated":
+                yield from self._staged(seg, name)
+            elif origin == "archived":
+                yield from self._replayed(seg, name)
+            else:
+                raise ReplayError(f"segment {seg['seg_id']!r} carries unknown "
+                                  f"ingested marker {origin!r}")
+
+    def _staged(self, seg, name: str):
+        for row in self.conn.execute(
+                f"SELECT * FROM st_{name} WHERE batch_id=? AND part=? "
+                f"ORDER BY item", (self.batch_id, seg["part"])):
+            yield _STAGED_PROJECT[name](row)
+
+    def _replayed(self, seg, name: str):
+        spans = self.conn.execute(
+            "SELECT byte_offset, items FROM segment_sections "
+            "WHERE seg_id=? AND section=? ORDER BY byte_offset",
+            (seg["seg_id"], name)).fetchall()
+        if not spans:
+            return
+        path = _archive_path(self.data_dir, seg["path"])
+        idx = 0
+        try:
+            with open(path, "rb") as fp:
+                for span in spans:
+                    got = 0
+                    for item in jsonstream.iter_array_at(fp,
+                                                         span["byte_offset"]):
+                        yield wire.validate_item(name, item, idx)
+                        idx += 1
+                        got += 1
+                    if got != span["items"]:
+                        raise ReplayError(
+                            f"archive {path} section {name!r}: expected "
+                            f"{span['items']} items, found {got}")
+        except FileNotFoundError as exc:
+            raise ReplayError(
+                f"archive for segment {seg['seg_id']!r} is missing: "
+                f"{path}") from exc
+        except jsonstream.JsonStreamError as exc:
+            raise ReplayError(
+                f"archive for segment {seg['seg_id']!r} cannot be replayed: "
+                f"{exc}") from exc
 
 
 def _effect(effects, kind, n=1):
     effects[kind] = effects.get(kind, 0) + n
 
 
-def _apply_ids(conn, batch_id, seq, effects):
-    for row in _rows(conn, "st_ids", batch_id):
-        old, new = row["old_ref"], row["new_ref"]
+def _apply_ids(conn, items, seq, effects):
+    for old, new in items.section("ids"):
         zone, local, _ = _split(new)
         uid_old = ref_uid(conn, old)
         uid_new = ref_uid(conn, new)
@@ -211,23 +304,22 @@ def _apply_ids(conn, batch_id, seq, effects):
         _effect(effects, "ids")
 
 
-def _apply_taps(conn, batch_id, seq, effects):
-    for row in _rows(conn, "st_taps", batch_id):
-        existed = ref_uid(conn, row["ref"]) is not None
-        uid = _ensure_joint(conn, row["ref"], row["zone"], row["local"], seq)
-        if row["attrs"] is not None:
+def _apply_taps(conn, items, seq, effects):
+    for ref, zone, local, attrs in items.section("taps"):
+        existed = ref_uid(conn, ref) is not None
+        uid = _ensure_joint(conn, ref, zone, local, seq)
+        if attrs is not None:
             conn.execute(
                 "UPDATE joints SET attrs = CASE "
                 "WHEN attrs IS NULL THEN json(?) ELSE json_patch(attrs, json(?)) "
-                "END WHERE uid=?", (row["attrs"], row["attrs"], uid))
+                "END WHERE uid=?", (attrs, attrs, uid))
         _effect(effects, "tap_updated" if existed else "tap_created")
 
 
-def _apply_lays(conn, batch_id, seq, effects):
-    for row in _rows(conn, "st_lays", batch_id):
-        code = row["code"]
-        fu = resolve_existing(conn, row["from_ref"], f"pipe {code}", seq)
-        tu = resolve_existing(conn, row["to_ref"], f"pipe {code}", seq)
+def _apply_lays(conn, items, seq, effects):
+    for code, from_ref, to_ref, attrs in items.section("lays"):
+        fu = resolve_existing(conn, from_ref, f"pipe {code}", seq)
+        tu = resolve_existing(conn, to_ref, f"pipe {code}", seq)
         if fu == tu:
             raise ApplyError(f"pipe {code} would connect joint uid {fu} to "
                              f"itself")
@@ -237,27 +329,27 @@ def _apply_lays(conn, batch_id, seq, effects):
             conn.execute(
                 "INSERT INTO pipes(code,from_uid,to_uid,created_seq,last_seq,"
                 "attrs) VALUES(?,?,?,?,?,?)",
-                (code, fu, tu, seq, seq, row["attrs"]))
+                (code, fu, tu, seq, seq, attrs))
             _effect(effects, "lay_created")
         else:
             moved = (old["from_uid"], old["to_uid"]) != (fu, tu)
-            attrs = old["attrs"]
-            if row["attrs"] is not None:
-                attrs = row["attrs"] if attrs is None else json.dumps(
-                    {**json.loads(attrs), **json.loads(row["attrs"])},
+            merged = old["attrs"]
+            if attrs is not None:
+                merged = attrs if merged is None else json.dumps(
+                    {**json.loads(merged), **json.loads(attrs)},
                     ensure_ascii=False, sort_keys=True)
             conn.execute(
                 "UPDATE pipes SET from_uid=?, to_uid=?, last_seq=?, "
                 "retired_seq=NULL, retired_by=NULL, attrs=? WHERE code=?",
-                (fu, tu, seq, attrs, code))
+                (fu, tu, seq, merged, code))
             _effect(effects, "lay_moved" if moved else "lay_updated")
 
 
-def _apply_redirects(conn, batch_id, seq, effects):
-    for row in _rows(conn, "st_redirects", batch_id):
-        if row["kind"] == "joint":
-            src = resolve_existing(conn, row["from_ref"], "redirect", seq)
-            dst = resolve_existing(conn, row["to_ref"], "redirect target", seq)
+def _apply_redirects(conn, items, seq, effects):
+    for kind, code, from_ref, to_ref in items.section("redirects"):
+        if kind == "joint":
+            src = resolve_existing(conn, from_ref, "redirect", seq)
+            dst = resolve_existing(conn, to_ref, "redirect target", seq)
             if src == dst:
                 continue
             loop = conn.execute(
@@ -272,9 +364,8 @@ def _apply_redirects(conn, batch_id, seq, effects):
                 "WHERE from_uid=? AND retired_seq IS NULL", (dst, seq, src))
             _effect(effects, "redirect_joint", cur.rowcount)
         else:
-            code = row["code"]
-            fu = resolve_existing(conn, row["from_ref"], f"pipe {code}", seq)
-            tu = resolve_existing(conn, row["to_ref"], f"pipe {code}", seq)
+            fu = resolve_existing(conn, from_ref, f"pipe {code}", seq)
+            tu = resolve_existing(conn, to_ref, f"pipe {code}", seq)
             if fu == tu:
                 raise ApplyError(f"pipe {code} would connect a joint to itself")
             cur = conn.execute(
@@ -286,10 +377,10 @@ def _apply_redirects(conn, batch_id, seq, effects):
             _effect(effects, "redirect_pipe")
 
 
-def _apply_retires(conn, batch_id, seq, effects):
-    for row in _rows(conn, "st_retires", batch_id):
-        if row["kind"] == "joint":
-            uid = resolve_existing(conn, row["ref"], "retire", seq)
+def _apply_retires(conn, items, seq, effects):
+    for kind, ref in items.section("retires"):
+        if kind == "joint":
+            uid = resolve_existing(conn, ref, "retire", seq)
             cur = conn.execute(
                 "UPDATE joints SET retired_seq=?, last_seq=? "
                 "WHERE uid=? AND retired_seq IS NULL", (seq, seq, uid))
@@ -305,10 +396,10 @@ def _apply_retires(conn, batch_id, seq, effects):
         else:
             cur = conn.execute(
                 "UPDATE pipes SET retired_seq=?, retired_by='explicit' "
-                "WHERE code=? AND retired_seq IS NULL", (seq, row["ref"]))
+                "WHERE code=? AND retired_seq IS NULL", (seq, ref))
             if cur.rowcount == 0:
                 raise ApplyError(f"retire names unknown or already retired "
-                                 f"pipe {row['ref']!r}")
+                                 f"pipe {ref!r}")
             _effect(effects, "pipe_retired")
 
 
@@ -321,7 +412,7 @@ APPLIERS = (
 )
 
 
-def apply_batch(conn, row) -> dict:
+def apply_batch(conn, row, data_dir="") -> dict:
     """Apply one complete batch.  Caller owns the transaction."""
     seq, batch_id = row["seq"], row["batch_id"]
     effects: dict = {}
@@ -338,8 +429,14 @@ def apply_batch(conn, row) -> dict:
                              f"upgrade already happened at seq {first}")
         meta_set(conn, "upgrade_seq", seq)
 
+    items = _Items(conn, data_dir, batch_id)
     for _, fn in APPLIERS:
-        fn(conn, batch_id, seq, effects)
+        fn(conn, items, seq, effects)
+
+    # an applied batch never needs its per-item rows again: drop whatever a
+    # legacy receiver staged for it, so publishing leaves no item copy behind
+    for name in wire.SEGMENT_ARRAYS:
+        conn.execute(f"DELETE FROM st_{name} WHERE batch_id=?", (batch_id,))
 
     conn.execute("DELETE FROM batch_effects WHERE batch_id=?", (batch_id,))
     for kind, n in sorted(effects.items()):
@@ -352,7 +449,7 @@ def apply_batch(conn, row) -> dict:
     return effects
 
 
-def publish_ready(conn, *, max_batches=None) -> dict:
+def publish_ready(conn, *, max_batches=None, data_dir="") -> dict:
     """Apply every batch that is complete and next in line.
 
     Returns a report: which batches were applied, and why publishing stopped.
@@ -378,7 +475,7 @@ def publish_ready(conn, *, max_batches=None) -> dict:
             conn.execute("ROLLBACK")
             continue
         try:
-            effects = apply_batch(conn, fresh)
+            effects = apply_batch(conn, fresh, data_dir)
             conn.execute("COMMIT")
         except ApplyError as exc:
             conn.execute("ROLLBACK")
@@ -390,9 +487,10 @@ def publish_ready(conn, *, max_batches=None) -> dict:
             stopped = {"reason": "rejected", "batch": row["batch_id"],
                        "seq": row["seq"], "error": str(exc)}
             break
-        except sqlite3.Error:
-            # storage-level failure: leave the batch staged so it can be
-            # retried after a restart instead of being rejected for good
+        except Exception:
+            # storage-level failure (including an archive that cannot be
+            # replayed): leave the batch staged so it can be retried after a
+            # restart instead of being rejected for good
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
             raise

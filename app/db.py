@@ -1,9 +1,10 @@
 """SQLite bootstrap: schema, connections, pragmas.
 
 A single database file holds both the append-only sync bookkeeping (landed
-segments, staging rows) and the published network.  That is deliberate: the
-acknowledgement of a segment and the staging rows derived from it commit in
-one transaction, so a ``kill -9`` can never leave the two out of step.
+segments, their section index) and the published network.  That is
+deliberate: the acknowledgement of a segment and the record that makes its
+archive replayable commit in one transaction, so a ``kill -9`` can never
+leave the two out of step.
 
 Readers open the database read-only and WAL lets them keep serving the last
 published batch while a large batch is being applied.
@@ -43,13 +44,28 @@ CREATE TABLE IF NOT EXISTS segments (
     nbytes      INTEGER NOT NULL,
     path        TEXT NOT NULL,
     received_at TEXT NOT NULL,
-    ingested    INTEGER NOT NULL DEFAULT 0,   -- 1 once staging rows exist
+    ingested    INTEGER NOT NULL DEFAULT 0,   -- 'validated': items staged in
+                                              -- st_* (legacy); 'archived':
+                                              -- items only in the archive
     UNIQUE (batch_id, part)
 );
 CREATE INDEX IF NOT EXISTS segments_batch ON segments(batch_id, part);
 
--- staging: one row per log item, ordered by (part, item) so a re-ingested
--- segment always replays in the same order.
+-- where each array section starts inside a segment's landed archive, so
+-- publishing can replay one section at a time, in apply order, without
+-- re-scanning whole files or keeping a translated copy of the items.
+CREATE TABLE IF NOT EXISTS segment_sections (
+    seg_id      TEXT NOT NULL REFERENCES segments(seg_id),
+    section     TEXT NOT NULL,
+    byte_offset INTEGER NOT NULL,   -- file offset of the section's '['
+    items       INTEGER NOT NULL,   -- elements in that array occurrence
+    PRIMARY KEY (seg_id, section, byte_offset)
+) WITHOUT ROWID;
+
+-- legacy staging: one row per log item, written by receivers that predate
+-- archive-only confirmation.  The current receiver never writes these; the
+-- publisher still reads them for segments an older receiver confirmed, and
+-- drops a batch's rows once that batch is applied.
 CREATE TABLE IF NOT EXISTS st_ids (
     batch_id TEXT NOT NULL, part INTEGER NOT NULL, item INTEGER NOT NULL,
     old_ref TEXT NOT NULL, new_ref TEXT NOT NULL,

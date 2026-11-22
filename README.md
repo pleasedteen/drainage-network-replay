@@ -6,18 +6,18 @@
 
 ```
 app/
-  jsonstream.py   大日志片段的分块 JSON 读取（单条占位内存，不整体载入）
+  jsonstream.py   大日志片段的分块 JSON 读取（单条占位内存，不整体载入）；记录分节字节偏移
   ids.py          接点/管段编号语法（旧号 J-000123、片区号 Q4:00123）
   wire.py         日志片段格式校验（整段校验通过才可能被确认）
   db.py           SQLite 结构与连接（WAL；读连接 mode=ro）
-  archive.py      接收：校验 → 落盘（内容寻址）→ 写入暂存表，与"确认"同一次提交
-  snapshot.py     按批次顺序把完整批次应用到已发布管网（单事务、可回滚）
+  archive.py      接收：校验 → 落盘（内容寻址）→ 记录片段与分节偏移，与"确认"同一次提交
+  snapshot.py     按批次顺序把完整批次应用到已发布管网（单事务、可回滚）；条目从归档字节回放
   tracing.py      沿水流方向做上游可达性追溯
   server.py       本地 HTTP 查询
   service.py      进程内编排（接收 → 发布 → 状态）
   replay.py       离线回放源 + 示例数据生成
-  __main__.py     命令行：sync / serve / status / trace
-tests/            47 个 unittest 用例（标准库，无需安装）
+  __main__.py     命令行：sync / publish / serve / status / trace
+tests/            53 个 unittest 用例（标准库，无需安装）
 examples/         demo.py、sample_batches/（示例日志）
 ```
 
@@ -30,6 +30,9 @@ python3 -m app.replay --out examples/sample_batches
 # 接收并应用：把目录里的 *.json 片段逐个投递（可反复运行，重复投递无副作用）
 python3 -m app sync  --db /tmp/drain.db --data /tmp/drain-data \
                      --from-source examples/sample_batches
+
+# 只把已确认、尚未发布的批次发布出去（例如强停重启之后，源端副本已清理）
+python3 -m app publish --db /tmp/drain.db --data /tmp/drain-data
 
 # 起本地查询服务
 python3 -m app serve --db /tmp/drain.db --data /tmp/drain-data --port 8787
@@ -86,30 +89,41 @@ timeout 80 python3 examples/demo.py
 | `redirects` | `from` 为接点：该接点出发的**所有**在用管段改从 `to` 出发；`from` 为管段号：该管段端点整体改为 `{"from","to"}` |
 | `retires` | 停用接点（连带停用它两端的在用管段）或停用管段 |
 
-规则：**任意元素校验失败 → 整个片段不确认**，暂存表无残留。未知字段同样拒绝
+规则：**任意元素校验失败 → 整个片段不确认**，不留任何记录。未知字段同样拒绝
 （避免"改了但没生效"的静默错误）。管段号以 `P-` 开头，接点号以 `J-`/片区号带冒号，
 两者不会混淆。
 
 ## 4. 接收、确认与崩溃恢复
 
-* 每个片段独立确认。确认 = 该片段的**落盘文件 + 暂存行 + 片段记录**在同一次 SQLite
-  事务里提交；提交之后源端即可清理副本。
+* 每个片段独立确认。确认 = 该片段的**落盘文件 + 片段记录（含各分节字节偏移）**
+  在同一次 SQLite 事务里提交；提交之后源端即可清理副本。确认的片段只保留
+  能回放的原始归档字节，不生成逐条中转副本。
 * 进程在提交后立刻被 `kill -9`：重启后该片段仍是"已确认"，不会要求重传
   （`tests/test_receive.py::test_ack_survives_hard_kill_and_restart`）。
-* 进程在提交前被杀死：事务回滚，暂存表和片段记录都不存在，源端重传即可
-  （`test_crash_during_staging_leaves_no_partial_state`）。
+* 进程在提交前被杀死：事务回滚，片段记录不存在，源端重传即可
+  （`test_crash_during_confirmation_leaves_no_partial_state`）。
 * 重复投递：按**内容摘要**去重——字节相同、或字节不同但内容等价（如缩进不同）都
   回答 `duplicate` 且 `acknowledged=false`，不重复写入。
 * 片段可乱序到达；同一批次可以等多片到齐才发布。并发投递安全
   （`test_concurrency.py`）。
+* 旧版本数据库里已确认的片段（条目在 `st_*` 暂存表中）无需迁移：发布时这些片
+  仍从暂存行读取，与新到片的归档回放按 `(part, item)` 原顺序合到同一批；批次
+  应用成功后其暂存行即被清除。
 
 ## 5. 按批次生效
 
 * 只有"下一顺位"的批次完整（`parts` 全部到齐，`total` 给出源端批次数）才会被应用。
 * 应用在**一个写事务**内完成；读连接永远看不到半个批次。
+* 发布不生成完整中转副本：按 `ids → taps → lays → redirects → retires` 的顺序，
+  每个分节直接按记录的字节偏移从归档文件流式回放，单条占位内存；整批归档的
+  读取量不超过本批归档大小的两倍（实际约为一遍）。源端副本已删除、进程强停
+  重启之后，`python3 -m app publish`（或再次 `sync`）仍能靠归档继续发布，
+  查询结果与"依据批次"不变。
 * 应用失败（数据与已有管网矛盾，例如管段指向不存在的接点）→ 回滚并标记
   `rejected`，保留错误原因；**上一次完整发布的管网继续可查**，后续批次被阻塞直到
   人工处理（`status` 会给出 blocker）。
+* 归档文件缺失或损坏不算数据矛盾：批次保持 `staging`，发布报错并可重试，
+  不会被误判成 `rejected`。
 * 有未完成批次时，查询照常返回最近一次完整发布的结果，响应里标明
   `snapshot.published_batch`（`test_queries_stay_available_while_a_big_batch_is_applied`）。
 
@@ -173,10 +187,11 @@ X 或 X 上游的**在用**管段；已停用管段不参与（不计入结果�
 ## 9. 测试
 
 ```bash
-python3 tests/run_all.py            # 47 个用例，约 10 秒
+python3 tests/run_all.py            # 53 个用例，约 10 秒
 python3 tests/run_all.py 2>/dev/null | tail -3
 ```
 
 覆盖面：乱序/重复/冲突片段、非法 JSON 与非法字段、`kill -9` 后恢复、发布中途失败回滚、
 超大批次（4 万接点+4 万管段、约 7 MB）在 96 MiB 数据段上限下接收并应用、应用期间并发查询、
-新旧编号等价、改向/停用的追溯语义、HTTP 状态码、离线回放与命令行全流程。
+新旧编号等价、改向/停用的追溯语义、HTTP 状态码、旧库暂存片段与新片段合批发布、
+发布期归档读取量上限、源副本删除并强停重启后的离线续发、离线回放与命令行全流程。

@@ -48,6 +48,7 @@ class _Reader:
         self.buf = ""
         self.pos = 0            # index into self.buf
         self.base = 0           # number of chars discarded from the front
+        self.byte_base = 0      # file byte offset of buf[0] (binary streams)
         self.eof = False
         self.decoder = json.JSONDecoder()
         # byte streams are decoded incrementally, so a multi-byte sequence
@@ -80,17 +81,33 @@ class _Reader:
                 self.eof = True
                 return False
         if self.pos:
-            self.base += self.pos
-            self.buf = self.buf[self.pos:]
-            self.pos = 0
+            self._advance(self.pos)
         self.buf += data
         return True
 
+    def _advance(self, n: int):
+        """Drop the first ``n`` chars from the buffer, tracking offsets."""
+        self.base += n
+        if not self.text:
+            # the decoder only ever emits whole characters, so re-encoding
+            # the consumed prefix reproduces exactly its source bytes
+            self.byte_base += len(self.buf[:n].encode("utf-8"))
+        self.buf = self.buf[n:]
+        self.pos = 0
+
     def _compact(self):
         if self.pos > self.chunk_size:
-            self.base += self.pos
-            self.buf = self.buf[self.pos:]
-            self.pos = 0
+            self._advance(self.pos)
+
+    def byte_offset(self) -> int:
+        """File byte offset of the character at ``self.pos``.
+
+        Only meaningful on binary streams; used to remember where a section
+        array starts so it can be re-read later without re-scanning the file.
+        """
+        if self.text:
+            raise JsonStreamError("byte offsets require a binary stream")
+        return self.byte_base + len(self.buf[:self.pos].encode("utf-8"))
 
     def _error(self, msg: str) -> JsonStreamError:
         return JsonStreamError(f"{msg} (near byte offset {self.base + self.pos})")
@@ -186,12 +203,15 @@ class _Reader:
 
 
 def iter_segment(fp, *, chunk_size: int = 65536, max_value_bytes: int = 1 << 20,
-                 on_field=None, on_array_item=None):
+                 on_field=None, on_array_item=None, on_array_start=None):
     """Stream one segment object.
 
     ``on_field(key, value)`` is called for scalar/object fields and
     ``on_array_item(key, item)`` for every element of an array field, in file
-    order.  The function returns once the closing brace has been consumed.
+    order.  ``on_array_start(key, byte_offset)`` fires when an array field
+    opens; the offset lets a later pass seek straight back to that array (see
+    ``iter_array_at``) instead of re-scanning the whole file.  The function
+    returns once the closing brace has been consumed.
     """
     reader = _Reader(fp, chunk_size=chunk_size, max_value_bytes=max_value_bytes)
     reader._expect("{")
@@ -206,6 +226,8 @@ def iter_segment(fp, *, chunk_size: int = 65536, max_value_bytes: int = 1 << 20,
         key = reader.key()
         reader._expect(":")
         if reader._peek() == "[":
+            if on_array_start is not None:
+                on_array_start(key, reader.byte_offset())
             for item in reader.array_items():
                 if on_array_item is not None:
                     on_array_item(key, item)
@@ -218,6 +240,20 @@ def iter_segment(fp, *, chunk_size: int = 65536, max_value_bytes: int = 1 << 20,
         rest = reader.buf[reader.pos:]
         if rest.strip():
             raise reader._error("trailing data after segment object")
+
+
+def iter_array_at(fp, offset: int, *, chunk_size: int = 65536,
+                  max_value_bytes: int = 1 << 20):
+    """Yield the items of the array whose ``[`` sits at byte ``offset``.
+
+    ``fp`` must be a binary stream positioned anywhere; it is seeked to the
+    offset first.  Iteration stops at the matching ``]`` -- the rest of the
+    file is left unread, so re-reading one section of a large segment costs
+    only that section's bytes.
+    """
+    fp.seek(offset)
+    reader = _Reader(fp, chunk_size=chunk_size, max_value_bytes=max_value_bytes)
+    yield from reader.array_items()
 
 
 

@@ -164,26 +164,27 @@ class ReceivingTest(TempDirTest):
         self.assertEqual(st["snapshot"]["published_batch"], "B-0001")
         self.assertEqual(st["snapshot"]["joints"], 6)
 
-    def test_crash_during_staging_leaves_no_partial_state(self):
+    def test_crash_during_confirmation_leaves_no_partial_state(self):
         db, data = self.work / "drain.db", self.work / "data"
         seg = self.write_batch("B-0001", 1, 1, items=basic_items(1, 2000))[0]
 
-        orig = archive._stage
+        orig = archive._record_segment
 
-        def boom(path, scan, conn, **kw):
+        def boom(*args, **kw):
             raise RuntimeError("simulated power loss")
 
-        archive._stage = boom
+        archive._record_segment = boom
         try:
             svc = service.SyncService(db, data)
             with self.assertRaises(RuntimeError):
                 svc.accept(seg)
         finally:
-            archive._stage = orig
+            archive._record_segment = orig
 
         conn = sqlite3.connect(db)
         try:
-            for table in ("segments", "st_taps", "st_lays", "batches"):
+            for table in ("segments", "segment_sections", "st_taps", "st_lays",
+                          "batches"):
                 n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                 self.assertEqual(n, 0, table)
         finally:
@@ -192,6 +193,46 @@ class ReceivingTest(TempDirTest):
         svc = service.SyncService(db, data)
         self.assertEqual(svc.accept(seg)["status"], "accepted")
         self.assertEqual(svc.status()["snapshot"]["joints"], 2000)
+
+    def test_confirmed_segment_keeps_only_replayable_archive(self):
+        svc = self.make_svc()
+        segs = self.write_batch("B-0001", 1, 1, parts=2,
+                                items=basic_items(1, 6))
+        out = svc.accept(segs[0])
+        self.assertEqual(out["status"], "accepted")
+
+        conn = sqlite3.connect(svc.db_path)
+        try:
+            for table in ("st_ids", "st_taps", "st_lays", "st_redirects",
+                          "st_retires"):
+                n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                self.assertEqual(n, 0, f"{table} must stay empty")
+            row = conn.execute(
+                "SELECT ingested, path, nbytes FROM segments").fetchone()
+            self.assertEqual(row[0], "archived")
+            spans = conn.execute(
+                "SELECT section, byte_offset, items FROM segment_sections "
+                "ORDER BY byte_offset").fetchall()
+        finally:
+            conn.close()
+
+        # the archive is byte-for-byte the delivered file and covers every
+        # section the segment carried
+        landed = self.work / "data" / row[1]
+        self.assertEqual(landed.read_bytes(), segs[0].read_bytes())
+        self.assertEqual(row[2], segs[0].stat().st_size)
+        self.assertEqual({s[0] for s in spans}, {"taps", "lays"})
+        self.assertEqual(sum(s[2] for s in spans if s[0] == "taps"), 3)
+        self.assertEqual(sum(s[2] for s in spans if s[0] == "lays"), 3)
+        for _, offset, _ in spans:
+            self.assertEqual(landed.read_bytes()[offset:offset + 1], b"[")
+
+        # finishing the batch publishes it by replaying the archives
+        svc.accept(segs[1])
+        st = svc.status()
+        self.assertEqual(st["snapshot"]["published_batch"], "B-0001")
+        self.assertEqual((st["snapshot"]["joints"], st["snapshot"]["pipes"]),
+                         (6, 5))
 
     def test_rejection_blocks_later_batches_but_keeps_snapshot(self):
         svc = self.make_svc()

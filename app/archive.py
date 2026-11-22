@@ -1,19 +1,21 @@
-"""Receiving segments: content-addressed landing plus SQLite staging.
+"""Receiving segments: content-addressed landing plus a replay index.
 
 A segment that passes validation is
 
 1. stored byte-for-byte under ``<data>/segments/`` (content-addressed, so a
    repeated delivery of the identical bytes costs one hash), and
-2. replayed a second time into the ``st_*`` staging tables, inside the *same*
-   transaction that records the segment row.
+2. recorded in the ``segments`` table together with the byte offsets of its
+   array sections (``segment_sections``), inside the *same* transaction.
 
 Only after that transaction commits does the receiver answer ``accepted`` --
-i.e. the source may drop its copy.  A crash before the commit rolls back both
-the staging rows and the segment record, so redelivery is always safe.
+i.e. the source may drop its copy.  A crash before the commit rolls back the
+segment record, so redelivery is always safe; the landed file itself is
+content-addressed and simply reused by the next delivery.
 
-A large segment is never held in memory: it is streamed item by item into
-SQLite staging rows from the on-disk copy.  Both passes read the file from
-disk, so heap use is one buffer plus one item.
+No per-item copy is kept anywhere: publishing re-reads the landed archive,
+one section at a time, straight from disk.  A large segment is therefore
+never held in memory -- validation streams it item by item, and so does the
+later replay.
 """
 
 from __future__ import annotations
@@ -29,18 +31,7 @@ from pathlib import Path
 from . import jsonstream, wire
 from .db import connect
 
-INSERT_SQL = {
-    "ids": "INSERT INTO st_ids(batch_id,part,item,old_ref,new_ref) "
-           "VALUES(?,?,?,?,?)",
-    "taps": "INSERT INTO st_taps(batch_id,part,item,ref,zone,local,attrs) "
-            "VALUES(?,?,?,?,?,?,?)",
-    "lays": "INSERT INTO st_lays(batch_id,part,item,code,from_ref,to_ref,"
-            "attrs) VALUES(?,?,?,?,?,?,?)",
-    "redirects": "INSERT INTO st_redirects(batch_id,part,item,kind,code,"
-                 "from_ref,to_ref) VALUES(?,?,?,?,?,?,?)",
-    "retires": "INSERT INTO st_retires(batch_id,part,item,kind,ref) "
-               "VALUES(?,?,?,?,?)",
-}
+
 class LandError(wire.SegmentError):
     """A segment that cannot be acknowledged for a reason other than shape."""
 
@@ -82,6 +73,7 @@ class _Scan:
     header: wire.Header
     counts: dict
     digest: str
+    spans: dict                # section -> [[byte_offset, items], ...]
 
 
 def _now() -> str:
@@ -97,9 +89,11 @@ def _file_sha256(path: Path) -> str:
 
 
 def _scan(path: Path, *, chunk_size: int) -> _Scan:
-    """Pass 1: validate every item, build the logical digest, write nothing."""
+    """Validate every item, build the logical digest, remember where each
+    array section starts so the archive can be replayed section by section."""
     fields: dict = {}
     counts = {name: 0 for name in wire.SEGMENT_ARRAYS}
+    spans: dict[str, list] = {}
     h = hashlib.sha256(b"segment-v1\0")
 
     def on_field(key, value):
@@ -112,57 +106,29 @@ def _scan(path: Path, *, chunk_size: int) -> _Scan:
             return
         fields[key] = value
 
+    def on_array_start(key, offset):
+        if key in wire.SEGMENT_ARRAYS:
+            spans.setdefault(key, []).append([offset, 0])
+
     def on_item(section, item):
         idx = counts[section]
         row = wire.validate_item(section, item, idx)
         counts[section] = idx + 1
+        spans[section][-1][1] += 1
         h.update(b"\n" + section.encode() + b":")
         h.update(wire.canonical(row))
 
     try:
         with open(path, "rb") as fp:
             jsonstream.iter_segment(fp, chunk_size=chunk_size,
-                                    on_field=on_field, on_array_item=on_item)
+                                    on_field=on_field, on_array_item=on_item,
+                                    on_array_start=on_array_start)
     except jsonstream.JsonStreamError as exc:
         raise wire.SegmentError(f"malformed JSON: {exc}") from exc
     header = wire.validate_header(fields)
     h.update(b"\nheader:")
     h.update(wire.canonical({k: getattr(header, k) for k in wire._HEADER_KEYS}))
-    return _Scan(header, counts, h.hexdigest())
-
-
-def _stage(path: Path, scan: _Scan, conn, *, chunk_size: int) -> None:
-    """Pass 2: stream validated items into staging rows."""
-    counters = {name: 0 for name in wire.SEGMENT_ARRAYS}
-
-    def on_field(key, value):
-        pass
-
-    pending = []
-
-    def on_item(section, item):
-        idx = counters[section]
-        row = wire.validate_item(section, item, idx)
-        pending.append((section, idx, row))
-        counters[section] = idx + 1
-        if len(pending) >= 500:
-            flush()
-
-    def flush():
-        for section, idx, row in pending:
-            conn.execute(INSERT_SQL[section],
-                         (scan.header.batch, scan.header.part, idx, *row))
-        pending.clear()
-
-    try:
-        with open(path, "rb") as fp:
-            jsonstream.iter_segment(fp, chunk_size=chunk_size,
-                                    on_field=on_field, on_array_item=on_item)
-    except jsonstream.JsonStreamError as exc:
-        raise wire.SegmentError(f"malformed JSON: {exc}") from exc
-    flush()
-    if counters != scan.counts:     # pragma: no cover - file changed mid-way
-        raise LandError("segment changed on disk between validation and staging")
+    return _Scan(header, counts, h.hexdigest(), spans)
 
 
 def _existing_row(conn, seg_id, digest):
@@ -209,9 +175,29 @@ def _parts_expected(conn, header: wire.Header) -> int:
     return header.parts
 
 
+def _record_segment(conn, header: wire.Header, scan: _Scan, nbytes: int,
+                    stored_path: str) -> None:
+    """Insert the segment row and its replay index.  Caller owns the
+    transaction; the landed archive file plus these rows are the whole
+    acknowledgement."""
+    conn.execute(
+        "INSERT INTO segments(seg_id, sha256, batch_id, part, parts, "
+        "seq, total, upgrade, nbytes, path, received_at, ingested) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,'archived')",
+        (header.segment, scan.digest, header.batch, header.part,
+         header.parts, header.seq, header.total, int(header.upgrade),
+         nbytes, stored_path, _now()))
+    for section, arrays in scan.spans.items():
+        for offset, items in arrays:
+            conn.execute(
+                "INSERT INTO segment_sections(seg_id,section,byte_offset,"
+                "items) VALUES(?,?,?,?)",
+                (header.segment, section, offset, items))
+
+
 def land_segment(db_path, data_dir, source_path, *, chunk_size: int = 65536,
                  copy: bool = True) -> LandResult:
-    """Validate, land and stage one segment.  Idempotent.
+    """Validate, land and record one segment.  Idempotent.
 
     Raises ``wire.SegmentError`` or ``LandError`` for anything that must not
     be acknowledged.
@@ -309,15 +295,9 @@ def land_segment(db_path, data_dir, source_path, *, chunk_size: int = 65536,
                 "ON CONFLICT(batch_id) DO NOTHING",
                 (header.batch, header.seq, header.total, int(header.upgrade),
                  parts_expected, _now()))
-            _stage(final if copy else src, scan, conn, chunk_size=chunk_size)
-            conn.execute(
-                "INSERT INTO segments(seg_id, sha256, batch_id, part, parts, "
-                "seq, total, upgrade, nbytes, path, received_at, ingested) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,'validated')",
-                (header.segment, scan.digest, header.batch, header.part,
-                 header.parts, header.seq, header.total, int(header.upgrade),
-                 nbytes, str(final.relative_to(data)) if copy else str(final),
-                 _now()))
+            _record_segment(conn, header, scan, nbytes,
+                            str(final.relative_to(data)) if copy
+                            else str(final))
             conn.execute(
                 "UPDATE batches SET parts_expected=MAX(parts_expected,?) "
                 "WHERE batch_id=?", (parts_expected, header.batch))

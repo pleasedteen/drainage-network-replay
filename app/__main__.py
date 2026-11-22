@@ -1,13 +1,16 @@
 """Command line entry point.
 
-    python -m app sync  --db DB --data DIR  [--from-source DIR] [--watch SEC]
-    python -m app serve --db DB [--data DIR] [--host H] [--port P]
-    python -m app status --db DB
-    python -m app trace  --db DB --ref REF [--format text|json]
+    python -m app sync    --db DB --data DIR  [--from-source DIR] [--watch SEC]
+    python -m app publish --db DB [--data DIR]
+    python -m app serve   --db DB [--data DIR] [--host H] [--port P]
+    python -m app status  --db DB
+    python -m app trace   --db DB --ref REF [--format text|json]
 
 ``sync --from-source`` replays every ``*.json`` segment in a directory (the
 offline replay source's delivery folder); ``--watch`` keeps polling it so
-segments that arrive later are picked up too.
+segments that arrive later are picked up too.  ``publish`` applies whatever
+complete batches are still waiting -- e.g. after a restart, when the source
+has already cleaned up its own copies and only the archives remain.
 """
 
 from __future__ import annotations
@@ -47,11 +50,21 @@ def _cmd_sync(args):
         if not args.watch:
             break
         time.sleep(args.watch)
+    svc.publish()        # flush batches confirmed earlier but not yet applied
     status = svc.status()
     print(json.dumps({"accepted": total,
                       "snapshot": status["snapshot"],
                       "publish_blocker": status["publish_blocker"]},
                      ensure_ascii=False, indent=1))
+    return 0
+
+
+def _cmd_publish(args):
+    if not Path(args.db).exists():
+        print(f"no database at {args.db}: run `sync` first", file=sys.stderr)
+        return 2
+    svc = service.SyncService(args.db, args.data or Path(args.db).parent / "data")
+    print(json.dumps(svc.publish(), ensure_ascii=False, indent=1))
     return 0
 
 
@@ -113,6 +126,12 @@ def main(argv=None):
     s.add_argument("--watch", type=float, default=0,
                    help="poll the directory every N seconds")
     s.set_defaults(func=_cmd_sync)
+
+    s = sub.add_parser("publish",
+                       help="apply complete batches that are still waiting")
+    s.add_argument("--db", required=True)
+    s.add_argument("--data", default="")
+    s.set_defaults(func=_cmd_publish)
 
     s = sub.add_parser("serve", help="run the local query API")
     s.add_argument("--db", required=True)

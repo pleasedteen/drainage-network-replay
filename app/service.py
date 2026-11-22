@@ -2,7 +2,7 @@
 
 ``SyncService`` is what the (offline) replay source calls.  It:
 
-* lands each segment (validate -> digest -> stage, one commit per segment);
+* lands each segment (validate -> digest -> archive, one commit per segment);
 * keeps a directory of accepted segments for the source to compare against;
 * publishes every batch that is complete and next in line, so queries served
   by the same process immediately see a finished batch;
@@ -10,7 +10,7 @@
   asking again gets the same answer instead of a different-looking status.
 
 Everything is restartable: a process killed after an acknowledgement but
-before publishing simply publishes the already-staged batch on startup.
+before publishing simply replays the already-archived batch on startup.
 """
 
 from __future__ import annotations
@@ -53,7 +53,8 @@ class SyncService:
         with self._publish_lock:
             conn = connect(self.db_path)
             try:
-                return snapshot.publish_ready(conn, max_batches=max_batches)
+                return snapshot.publish_ready(conn, max_batches=max_batches,
+                                              data_dir=self.data_dir)
             finally:
                 conn.close()
 
